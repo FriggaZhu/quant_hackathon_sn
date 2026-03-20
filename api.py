@@ -134,6 +134,9 @@ class RoostooClient:
     def get_ticker(self, pair: str) -> Dict[str, Any]:
         return self._request("GET", "/v3/ticker", params={"pair": pair})
 
+    def get_balance(self) -> Dict[str, Any]:
+        return self._request("GET", "/v3/balance")
+
     def place_order(
         self,
         pair: str,

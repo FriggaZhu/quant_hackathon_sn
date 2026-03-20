@@ -14,6 +14,7 @@ This project is a starter bot built for learning:
 The bot:
 
 - fetches market data from the Roostoo API
+- fetches spot wallet balance from the Roostoo API
 - stores recent prices in memory
 - applies a simple momentum strategy
 - decides `BUY`, `SELL`, or `HOLD`
@@ -55,10 +56,18 @@ The app now loads `.env` automatically when it starts, so you do not need to run
 python main.py
 ```
 
+Useful one-off commands:
+
+```bash
+python main.py --balance
+python main.py --pnl
+```
+
 While it runs, the bot now writes:
 
 - `logs/bot.log`: readable runtime log
-- `logs/trade_history.jsonl`: one JSON record per cycle with timestamp, price, signal, and order result
+- `logs/trade_history.jsonl`: one JSON record per cycle with timestamp, price, signal, wallet snapshot, wallet change, and order result
+- `logs/starting_wallet.json`: the baseline wallet used for simple PnL comparison
 
 You can watch the latest entries with:
 
@@ -94,6 +103,11 @@ Signature method:
 
 - HMAC SHA256
 - payload is a sorted query-string-style serialization of request fields
+
+Balance notes:
+
+- the bot reads the balance endpoint with `GET /v3/balance`
+- it expects the wallet field to be `SpotWallet`
 
 ## Safety Notes
 
