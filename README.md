@@ -42,13 +42,30 @@ ROOSTOO_API_KEY=your_api_key
 ROOSTOO_SECRET_KEY=your_secret_key
 ROOSTOO_PAIR=BTC/USD
 ROOSTOO_ORDER_QUANTITY=1
-ROOSTOO_POLL_INTERVAL=60
+ROOSTOO_POLL_INTERVAL=300
+ROOSTOO_HISTORY_SIZE=100
 ROOSTOO_ENABLE_TRADING=false
 ```
 
 The app now loads `.env` automatically when it starts, so you do not need to run `export ...` every time.
 
 `ROOSTOO_ENABLE_TRADING=false` keeps the bot in dry-run mode so it logs intended trades without sending orders.
+
+For the EMA/RSI strategy, a 5-minute polling interval is a reasonable default in live mode:
+
+```text
+ROOSTOO_POLL_INTERVAL=300
+ROOSTOO_HISTORY_SIZE=100
+ROOSTOO_FAST_EMA_PERIOD=9
+ROOSTOO_SLOW_EMA_PERIOD=21
+ROOSTOO_RSI_PERIOD=14
+ROOSTOO_RSI_BUY_THRESHOLD=55
+ROOSTOO_RSI_SELL_THRESHOLD=45
+ROOSTOO_MIN_EMA_GAP_PCT=0
+ROOSTOO_STOP_LOSS_PCT=0.015
+ROOSTOO_TAKE_PROFIT_PCT=0.03
+ROOSTOO_COOLDOWN_PERIODS=3
+```
 
 ## Run
 
@@ -75,15 +92,48 @@ You can watch the latest entries with:
 tail -f logs/bot.log
 ```
 
+## Backtesting With Historical Data
+
+You can now run the current strategy against historical CSV data without calling the Roostoo API.
+
+Supported inputs:
+
+- Binance Vision kline CSV downloads, using the `close` column
+- simple two-column CSV files in the format `timestamp,close`
+
+Example:
+
+```bash
+python main.py --backtest data/BTCUSDT-1h.csv
+```
+
+Backtest settings come from `.env`:
+
+```text
+ROOSTOO_BACKTEST_INITIAL_CASH=10000
+ROOSTOO_BACKTEST_FEE_RATE=0.001
+```
+
+The backtest currently simulates a simple spot account:
+
+- starts in cash
+- buys with the full cash balance on a `BUY` signal
+- sells the full position on a `SELL` signal
+- applies a fee on each buy and sell
+
+This is intentionally lightweight so you can validate strategy behavior first before adding more advanced metrics.
+
 ## Strategy
 
-Current strategy: simple momentum
+Current strategy: long-only EMA/RSI trend following
 
-- if price increases, signal `BUY`
-- if price decreases, signal `SELL`
-- if price is unchanged or there is not enough history, signal `HOLD`
+- entry requires `EMA(9)` to cross above `EMA(21)` and RSI to be above the buy threshold
+- entries can also require a minimum percentage gap between the fast and slow EMAs
+- exit happens on stop loss, take profit, EMA cross down, or RSI weakness
+- the bot holds at most one position at a time
+- a cooldown delays re-entry after each sell to reduce churn
 
-This is intentionally minimal and is meant for testing API integration and bot behavior, not for real trading performance.
+This is still intentionally simple, but it is much closer to a competition-ready spot strategy than the original one-step momentum rule.
 
 ## API Notes
 
@@ -118,8 +168,6 @@ Balance notes:
 
 ## Future Improvements
 
-- better momentum signals
 - volatility filters
-- risk management
 - persistent trade/performance logs
 - stronger response validation

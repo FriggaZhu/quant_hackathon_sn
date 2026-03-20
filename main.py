@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from api import RoostooAPIError, RoostooClient
-from strategy import simple_momentum_signal
+from backtest import load_price_bars, run_backtest
+from strategy import StrategyConfig, evaluate_strategy
 
 
 PAIR = os.getenv("ROOSTOO_PAIR", "BTC/USD")
@@ -21,6 +22,19 @@ LOG_DIR = Path(os.getenv("ROOSTOO_LOG_DIR", "logs"))
 BOT_LOG_FILE = LOG_DIR / "bot.log"
 TRADE_HISTORY_FILE = LOG_DIR / "trade_history.jsonl"
 STARTING_BALANCE_FILE = LOG_DIR / "starting_wallet.json"
+BACKTEST_INITIAL_CASH = float(os.getenv("ROOSTOO_BACKTEST_INITIAL_CASH", "10000"))
+BACKTEST_FEE_RATE = float(os.getenv("ROOSTOO_BACKTEST_FEE_RATE", "0.001"))
+STRATEGY_CONFIG = StrategyConfig(
+    fast_ema_period=int(os.getenv("ROOSTOO_FAST_EMA_PERIOD", "9")),
+    slow_ema_period=int(os.getenv("ROOSTOO_SLOW_EMA_PERIOD", "21")),
+    rsi_period=int(os.getenv("ROOSTOO_RSI_PERIOD", "14")),
+    rsi_buy_threshold=float(os.getenv("ROOSTOO_RSI_BUY_THRESHOLD", "55")),
+    rsi_sell_threshold=float(os.getenv("ROOSTOO_RSI_SELL_THRESHOLD", "45")),
+    min_ema_gap_pct=float(os.getenv("ROOSTOO_MIN_EMA_GAP_PCT", "0")),
+    stop_loss_pct=float(os.getenv("ROOSTOO_STOP_LOSS_PCT", "0.015")),
+    take_profit_pct=float(os.getenv("ROOSTOO_TAKE_PROFIT_PCT", "0.03")),
+    cooldown_periods=int(os.getenv("ROOSTOO_COOLDOWN_PERIODS", "3")),
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -238,14 +252,32 @@ def print_pnl() -> None:
     )
 
 
+def print_backtest(csv_path: str) -> None:
+    bars = load_price_bars(csv_path)
+    summary = run_backtest(
+        bars,
+        starting_cash=BACKTEST_INITIAL_CASH,
+        fee_rate=BACKTEST_FEE_RATE,
+        strategy_config=STRATEGY_CONFIG,
+    )
+    summary["csv_path"] = csv_path
+    summary["pair"] = PAIR
+    print(json.dumps(summary, indent=2, sort_keys=True))
+
+
 def run_bot() -> None:
     configure_logging()
     client = RoostooClient()
-    price_history = deque(maxlen=PRICE_HISTORY_SIZE)
+    history_size = max(PRICE_HISTORY_SIZE, STRATEGY_CONFIG.required_history + 5)
+    price_history = deque(maxlen=history_size)
     starting_wallet: Optional[Dict[str, float]] = None
+    in_position = False
+    entry_price: Optional[float] = None
+    cooldown_remaining = 0
 
     logger.info("Starting Roostoo trading bot for %s", PAIR)
     logger.info("Live trading enabled: %s", LIVE_TRADING_ENABLED)
+    logger.info("Strategy config: %s", STRATEGY_CONFIG)
 
     while True:
         try:
@@ -262,20 +294,57 @@ def run_bot() -> None:
             price_history.append(price)
             wallet_change = calculate_wallet_change(starting_wallet, current_wallet)
 
-            signal = simple_momentum_signal(price_history)
-            logger.info("Latest price: %.8f | Signal: %s", price, signal)
+            decision = evaluate_strategy(
+                list(price_history),
+                in_position=in_position,
+                entry_price=entry_price,
+                cooldown_remaining=cooldown_remaining,
+                config=STRATEGY_CONFIG,
+            )
+            signal = decision.signal
+            logger.info(
+                "Latest price: %.8f | Signal: %s | Reason: %s | EMA%d: %s | EMA%d: %s | RSI: %s | In position: %s | Cooldown: %d",
+                price,
+                signal,
+                decision.reason,
+                STRATEGY_CONFIG.fast_ema_period,
+                f"{decision.fast_ema:.8f}" if decision.fast_ema is not None else "n/a",
+                STRATEGY_CONFIG.slow_ema_period,
+                f"{decision.slow_ema:.8f}" if decision.slow_ema is not None else "n/a",
+                f"{decision.rsi:.2f}" if decision.rsi is not None else "n/a",
+                in_position,
+                cooldown_remaining,
+            )
             logger.info("Spot wallet: %s", current_wallet)
             logger.info("Wallet change since start: %s", wallet_change)
 
             order_result = maybe_place_order(client, signal)
+            if signal == "BUY" and order_result.get("status") in {"dry_run", "placed"}:
+                in_position = True
+                entry_price = price
+                cooldown_remaining = 0
+            elif signal == "SELL" and order_result.get("status") in {"dry_run", "placed"}:
+                in_position = False
+                entry_price = None
+                cooldown_remaining = STRATEGY_CONFIG.cooldown_periods
+            elif cooldown_remaining > 0:
+                cooldown_remaining -= 1
+
             append_trade_history(
                 {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "pair": PAIR,
                     "price": price,
                     "signal": signal,
+                    "signal_reason": decision.reason,
+                    "fast_ema": decision.fast_ema,
+                    "slow_ema": decision.slow_ema,
+                    "rsi": decision.rsi,
                     "history_size": len(price_history),
                     "live_trading_enabled": LIVE_TRADING_ENABLED,
+                    "strategy_in_position": in_position,
+                    "strategy_entry_price": entry_price,
+                    "strategy_cooldown_remaining": cooldown_remaining,
                     "wallet": current_wallet,
                     "wallet_change": wallet_change,
                     "order": order_result,
@@ -336,6 +405,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print wallet change since the recorded starting balance and exit.",
     )
+    parser.add_argument(
+        "--backtest",
+        metavar="CSV_PATH",
+        help="Run an offline backtest using a Binance kline CSV or timestamp,close CSV.",
+    )
     return parser.parse_args()
 
 
@@ -345,5 +419,7 @@ if __name__ == "__main__":
         print_balance()
     elif args.pnl:
         print_pnl()
+    elif args.backtest:
+        print_backtest(args.backtest)
     else:
         run_bot()
