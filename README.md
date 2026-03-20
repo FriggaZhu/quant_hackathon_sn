@@ -34,13 +34,7 @@ Install the dependency:
 pip install requests
 ```
 
-Create a local `.env` file from the example:
-
-```bash
-cp .env.example .env
-```
-
-Then open `.env` and fill in your real values:
+Create a local `.env` file and fill in your real values:
 
 ```text
 ROOSTOO_API_KEY=your_api_key
