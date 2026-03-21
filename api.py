@@ -5,7 +5,6 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import urlencode
 
 import requests
 
@@ -54,7 +53,7 @@ def build_signature(payload: str, secret_key: str) -> str:
 
 def serialize_params(params: Dict[str, Any]) -> str:
     filtered = {key: value for key, value in params.items() if value is not None}
-    return urlencode(sorted(filtered.items()))
+    return "&".join(f"{key}={filtered[key]}" for key in sorted(filtered.keys()))
 
 
 class RoostooClient:
