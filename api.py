@@ -70,18 +70,23 @@ class RoostooClient:
         self.base_url = (base_url or BASE_URL).rstrip("/")
         self.timeout = timeout
 
-    def _headers(self, payload: str, timestamp: str) -> Dict[str, str]:
+    def _headers(
+        self,
+        payload: str,
+        content_type: Optional[str] = None,
+    ) -> Dict[str, str]:
         if not self.api_key or not self.secret_key:
             raise RoostooAPIError(
                 "Missing API credentials. Set ROOSTOO_API_KEY and ROOSTOO_SECRET_KEY."
             )
 
-        return {
-            "Content-Type": "application/json",
+        headers = {
             "RST-API-KEY": self.api_key,
             "MSG-SIGNATURE": build_signature(payload, self.secret_key),
-            "TIMESTAMP": timestamp,
         }
+        if content_type:
+            headers["Content-Type"] = content_type
+        return headers
 
     def _request(
         self,
@@ -97,7 +102,7 @@ class RoostooClient:
         if method.upper() == "GET":
             payload_dict = {**params, "timestamp": timestamp}
             payload = serialize_params(payload_dict)
-            headers = self._headers(payload, timestamp)
+            headers = self._headers(payload)
             request_params = payload_dict
             response = requests.get(
                 f"{self.base_url}{endpoint}",
@@ -108,11 +113,11 @@ class RoostooClient:
         else:
             body = {**data, "timestamp": timestamp}
             payload = serialize_params(body)
-            headers = self._headers(payload, timestamp)
+            headers = self._headers(payload, "application/x-www-form-urlencoded")
             response = requests.post(
                 f"{self.base_url}{endpoint}",
                 headers=headers,
-                json=body,
+                data=body,
                 timeout=self.timeout,
             )
 
@@ -149,8 +154,8 @@ class RoostooClient:
             "/v3/place_order",
             data={
                 "pair": pair,
-                "side": side,
-                "quantity": quantity,
-                "type": order_type,
+                "side": side.upper(),
+                "quantity": str(quantity),
+                "type": order_type.upper(),
             },
         )
