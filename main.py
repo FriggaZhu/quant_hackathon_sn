@@ -8,6 +8,7 @@ import time
 from collections import deque
 from dataclasses import asdict
 from datetime import datetime, timezone
+from math import floor
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -545,6 +546,23 @@ def extract_price(ticker_response: Dict[str, Any], pair: str) -> float:
     raise ValueError(f"Could not find a usable price in ticker response: {ticker_response}")
 
 
+def _format_quantity_for_pair(client: RoostooClient, pair: str, quantity: float, price: float) -> Optional[tuple[float, str]]:
+    pair_rules = client.get_pair_rules(pair)
+    amount_precision = int(pair_rules.get("AmountPrecision", 8))
+    min_order_notional = float(pair_rules.get("MiniOrder", 0.0))
+    multiplier = 10**amount_precision
+    adjusted_quantity = floor(quantity * multiplier) / multiplier
+    adjusted_quantity = round(adjusted_quantity, amount_precision)
+    if adjusted_quantity <= 0:
+        return None
+    if min_order_notional > 0 and adjusted_quantity * price < min_order_notional:
+        return None
+    quantity_text = f"{adjusted_quantity:.{amount_precision}f}".rstrip("0").rstrip(".")
+    if not quantity_text:
+        quantity_text = "0"
+    return adjusted_quantity, quantity_text
+
+
 def maybe_place_order(
     client: RoostooClient,
     pair: str,
@@ -587,6 +605,15 @@ def maybe_place_order(
         order_notional = quantity * price
 
     portfolio_before = portfolio_state.to_dict()
+    formatted_quantity = _format_quantity_for_pair(client, pair, quantity, price)
+    if formatted_quantity is None:
+        return {
+            "status": "skipped",
+            "reason": "quantity_below_exchange_minimum",
+            "side": signal,
+            "pair": pair,
+        }
+    quantity, quantity_text = formatted_quantity
 
     if not LIVE_TRADING_ENABLED:
         logger.info(
@@ -614,7 +641,21 @@ def maybe_place_order(
             "execution": asdict(execution) if execution is not None else None,
         }
 
-    result = client.place_order(pair=pair, side=signal, quantity=quantity)
+    result = client.place_order(pair=pair, side=signal, quantity=quantity_text)
+    if not result.get("Success", False):
+        logger.warning("Order rejected by exchange: %s", result)
+        return {
+            "status": "rejected",
+            "side": signal,
+            "quantity": quantity,
+            "notional": order_notional,
+            "pair": pair,
+            "buy_fraction_pct_multiplier": buy_fraction_pct_multiplier,
+            "response": result,
+            "portfolio_before": portfolio_before,
+            "portfolio_after": portfolio_before,
+            "execution": None,
+        }
     logger.info("Order placed successfully: %s", result)
     execution = (
         apply_buy(portfolio_state, price, BACKTEST_FEE_RATE, order_notional)
@@ -671,6 +712,10 @@ def maybe_place_shared_order(
         order_notional = quantity * price
 
     portfolio_before = portfolio_state.to_dict()
+    formatted_quantity = _format_quantity_for_pair(client, pair, quantity, price)
+    if formatted_quantity is None:
+        return {"status": "skipped", "reason": "quantity_below_exchange_minimum", "side": signal, "pair": pair}
+    quantity, quantity_text = formatted_quantity
 
     if not LIVE_TRADING_ENABLED:
         logger.info(
@@ -687,7 +732,22 @@ def maybe_place_shared_order(
             else shared_apply_sell(portfolio_state, pair, price, BACKTEST_FEE_RATE, quantity)
         )
     else:
-        result = client.place_order(pair=pair, side=signal, quantity=quantity)
+        result = client.place_order(pair=pair, side=signal, quantity=quantity_text)
+        if not result.get("Success", False):
+            logger.warning("Order rejected by exchange for %s: %s", pair, result)
+            return {
+                "status": "rejected",
+                "side": signal,
+                "quantity": quantity,
+                "notional": order_notional,
+                "pair": pair,
+                "buy_fraction_pct_multiplier": buy_fraction_pct_multiplier,
+                "response": result,
+                "portfolio_before": portfolio_before,
+                "portfolio_after": portfolio_before,
+                "position_after": position.to_dict(),
+                "execution": None,
+            }
         logger.info("Order placed successfully for %s: %s", pair, result)
         execution = (
             shared_apply_buy(portfolio_state, pair, price, BACKTEST_FEE_RATE, order_notional)

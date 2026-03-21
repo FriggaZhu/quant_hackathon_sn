@@ -68,6 +68,7 @@ class RoostooClient:
         self.secret_key = secret_key or SECRET_KEY
         self.base_url = (base_url or BASE_URL).rstrip("/")
         self.timeout = timeout
+        self._exchange_info_cache: Optional[Dict[str, Any]] = None
 
     def _headers(
         self,
@@ -137,6 +138,39 @@ class RoostooClient:
 
     def get_ticker(self, pair: str) -> Dict[str, Any]:
         return self._request("GET", "/v3/ticker", params={"pair": pair})
+
+    def get_exchange_info(self, refresh: bool = False) -> Dict[str, Any]:
+        if self._exchange_info_cache is not None and not refresh:
+            return self._exchange_info_cache
+
+        response = requests.get(
+            f"{self.base_url}/v3/exchangeInfo",
+            timeout=self.timeout,
+        )
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise RoostooAPIError(
+                f"GET /v3/exchangeInfo failed with status {response.status_code}: {response.text}"
+            ) from exc
+
+        try:
+            payload = response.json()
+        except json.JSONDecodeError as exc:
+            raise RoostooAPIError(
+                f"GET /v3/exchangeInfo returned invalid JSON: {response.text}"
+            ) from exc
+
+        self._exchange_info_cache = payload
+        return payload
+
+    def get_pair_rules(self, pair: str) -> Dict[str, Any]:
+        exchange_info = self.get_exchange_info()
+        trade_pairs = exchange_info.get("TradePairs", {})
+        pair_rules = trade_pairs.get(pair)
+        if not isinstance(pair_rules, dict):
+            raise RoostooAPIError(f"Pair {pair} not found in exchange info.")
+        return pair_rules
 
     def get_balance(self) -> Dict[str, Any]:
         return self._request("GET", "/v3/balance")
