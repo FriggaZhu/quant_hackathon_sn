@@ -335,6 +335,23 @@ def build_mr_trend_extension_cases() -> List[tuple[str, Dict[str, str]]]:
     ]
 
 
+def build_mtf_v2_cases() -> List[tuple[str, Dict[str, str]]]:
+    return [
+        (
+            "mean_reversion_current_baseline",
+            {
+                "ROOSTOO_STRATEGY": "mean_reversion",
+            },
+        ),
+        (
+            "mtf_mean_reversion_v2_experimental",
+            {
+                "ROOSTOO_STRATEGY": "mtf_mean_reversion_v2",
+            },
+        ),
+    ]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare a preset set of strategies on one backtest window.")
     parser.add_argument(
@@ -352,7 +369,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--preset",
         default="v2",
-        choices=["v2", "mr_competition", "mr_positive_push", "mr_trend_extension"],
+        choices=["v2", "mr_competition", "mr_positive_push", "mr_trend_extension", "mtf_v2"],
         help="Comparison preset to run. Default: v2",
     )
     parser.add_argument(
@@ -381,6 +398,8 @@ def main() -> None:
         cases = build_mr_positive_push_cases()
     elif args.preset == "mr_trend_extension":
         cases = build_mr_trend_extension_cases()
+    elif args.preset == "mtf_v2":
+        cases = build_mtf_v2_cases()
     else:
         raise ValueError(f"Unsupported preset: {args.preset}")
     COMPARE_SUMMARY_DIR.mkdir(parents=True, exist_ok=True)

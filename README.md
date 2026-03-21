@@ -55,6 +55,18 @@ ROOSTOO_PORTFOLIO_SELL_FRACTION_PCT=0.75
 ROOSTOO_PORTFOLIO_DUST_TRADE_NOTIONAL=50
 ```
 
+If you must guarantee at least one executed trade per UTC day, you can enable the daily-trade overlay:
+
+```text
+ROOSTOO_REQUIRE_DAILY_TRADE=true
+ROOSTOO_DAILY_TRADE_TRIGGER_HOUR_UTC=18
+ROOSTOO_DAILY_TRADE_TRIGGER_MINUTE_UTC=0
+ROOSTOO_DAILY_TRADE_FALLBACK_PAIR=BTC/USD
+ROOSTOO_DAILY_TRADE_FALLBACK_BUY_FRACTION_PCT=0.005
+```
+
+This overlay leaves the primary strategy unchanged. If no trade has executed yet by the trigger time, it sends one small fallback order on the configured pair to satisfy the daily activity rule.
+
 The app now loads `.env` automatically when it starts, so you do not need to run `export ...` every time.
 
 `ROOSTOO_ENABLE_TRADING=false` keeps the bot in dry-run mode so it logs intended trades without sending orders.
@@ -64,6 +76,7 @@ Switch strategies with one env var:
 ```text
 ROOSTOO_STRATEGY=mean_reversion
 ROOSTOO_STRATEGY=mtf_mean_reversion
+ROOSTOO_STRATEGY=mtf_mean_reversion_v2
 ROOSTOO_STRATEGY=multi_factor
 ROOSTOO_STRATEGY=regime_switch
 ```
@@ -114,6 +127,16 @@ ROOSTOO_MR_TREND_EXTENSION_RSI_THRESHOLD=54
 ROOSTOO_MR_TREND_EXTENSION_TRAILING_STOP_PCT=0.010
 ROOSTOO_MR_REQUIRE_PRICE_ABOVE_TREND_EMA_FOR_ENTRY=false
 ROOSTOO_MR_ENTRY_BELOW_TREND_EMA_BUFFER_PCT=0.0
+```
+
+For the current best live candidate plus the daily-trade requirement overlay, keep the tuned mean-reversion settings above and add:
+
+```text
+ROOSTOO_REQUIRE_DAILY_TRADE=true
+ROOSTOO_DAILY_TRADE_TRIGGER_HOUR_UTC=18
+ROOSTOO_DAILY_TRADE_TRIGGER_MINUTE_UTC=0
+ROOSTOO_DAILY_TRADE_FALLBACK_PAIR=BTC/USD
+ROOSTOO_DAILY_TRADE_FALLBACK_BUY_FRACTION_PCT=0.005
 ```
 
 Alternative starting config for the multi-factor strategy:
@@ -177,6 +200,36 @@ ROOSTOO_MTF_STOP_LOSS_PCT=0.01
 ROOSTOO_MTF_TAKE_PROFIT_PCT=0.015
 ROOSTOO_MTF_COOLDOWN_PERIODS=4
 ```
+
+Experimental 15m-filter / 5m-execution strategy:
+
+```text
+ROOSTOO_STRATEGY=mtf_mean_reversion_v2
+ROOSTOO_POLL_INTERVAL=300
+ROOSTOO_MTF_V2_BASE_CANDLE_MINUTES=5
+ROOSTOO_MTF_V2_FILTER_CANDLE_MINUTES=15
+ROOSTOO_MTF_V2_FILTER_TREND_EMA_PERIOD=50
+ROOSTOO_MTF_V2_FILTER_VOLATILITY_PERIOD=20
+ROOSTOO_MTF_V2_FILTER_MAX_VOLATILITY=0.013
+ROOSTOO_MTF_V2_FILTER_MIN_DISTANCE_TO_MID_PCT=0.009
+ROOSTOO_MTF_V2_FILTER_ENTRY_BELOW_TREND_EMA_BUFFER_PCT=0.005
+ROOSTOO_MTF_V2_EXEC_BOLLINGER_PERIOD=20
+ROOSTOO_MTF_V2_EXEC_RSI_PERIOD=14
+ROOSTOO_MTF_V2_EXEC_RSI_ENTRY_THRESHOLD=28
+ROOSTOO_MTF_V2_EXEC_RSI_EXIT_THRESHOLD=58
+ROOSTOO_MTF_V2_EXEC_VOLATILITY_PERIOD=20
+ROOSTOO_MTF_V2_EXEC_MAX_VOLATILITY=0.010
+ROOSTOO_MTF_V2_STOP_LOSS_PCT=0.007
+ROOSTOO_MTF_V2_TAKE_PROFIT_PCT=0.011
+ROOSTOO_MTF_V2_MINIMUM_HOLD_BARS=3
+ROOSTOO_MTF_V2_TREND_EXTENSION_ENABLED=true
+ROOSTOO_MTF_V2_TREND_EXTENSION_EMA_FAST_PERIOD=9
+ROOSTOO_MTF_V2_TREND_EXTENSION_EMA_SLOW_PERIOD=21
+ROOSTOO_MTF_V2_TREND_EXTENSION_RSI_THRESHOLD=55
+ROOSTOO_MTF_V2_TREND_EXTENSION_TRAILING_STOP_PCT=0.009
+```
+
+This experimental strategy is designed for a 5-minute primary stream and derives a 15-minute filter internally by grouping 3 consecutive 5-minute closes. Keep the current tuned `mean_reversion` live setup as the deployment baseline while testing this one separately.
 
 ## Run
 
@@ -346,6 +399,7 @@ Built-in strategies:
 
 - `mean_reversion`: Bollinger/RSI pullback entries with configurable trend-extension exits
 - `mtf_mean_reversion`: mean-reversion entries gated by derived 1h and 4h trend filters
+- `mtf_mean_reversion_v2`: experimental 15m filter plus 5m execution model derived from grouped 5m closes
 - `multi_factor`: regime-aware trend-pullback scoring model
 - `regime_switch`: switches between trend-following and mean-reversion based on trend slope and volatility
 

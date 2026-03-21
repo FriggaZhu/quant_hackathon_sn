@@ -128,6 +128,57 @@ class MultiTimeframeMeanReversionConfig:
 
 
 @dataclass
+class MultiTimeframeMeanReversionV2Config:
+    base_candle_minutes: int = 5
+    filter_candle_minutes: int = 15
+    filter_bollinger_period: int = 20
+    filter_bollinger_stddev: float = 2.0
+    filter_trend_ema_period: int = 50
+    filter_rsi_period: int = 14
+    filter_volatility_period: int = 20
+    filter_max_volatility: float = 0.013
+    filter_min_distance_to_mid_pct: float = 0.009
+    filter_entry_below_trend_ema_buffer_pct: float = 0.005
+    exec_bollinger_period: int = 20
+    exec_bollinger_stddev: float = 2.0
+    exec_rsi_period: int = 14
+    exec_rsi_entry_threshold: float = 28.0
+    exec_rsi_exit_threshold: float = 58.0
+    exec_volatility_period: int = 20
+    exec_max_volatility: float = 0.010
+    exec_lower_band_entry_buffer_pct: float = 0.002
+    stop_loss_pct: float = 0.007
+    take_profit_pct: float = 0.011
+    cooldown_periods: int = 4
+    minimum_hold_bars: int = 3
+    strong_buy_fraction_pct: float = 0.08
+    assumed_round_trip_cost_pct: float = 0.0025
+    minimum_edge_to_cost_ratio: float = 1.5
+    trend_extension_enabled: bool = True
+    trend_extension_ema_fast_period: int = 9
+    trend_extension_ema_slow_period: int = 21
+    trend_extension_rsi_threshold: float = 55.0
+    trend_extension_trailing_stop_pct: float = 0.009
+
+    @property
+    def filter_group_size(self) -> int:
+        return max(1, self.filter_candle_minutes // self.base_candle_minutes)
+
+    @property
+    def required_history(self) -> int:
+        return max(
+            (self.filter_bollinger_period + 1) * self.filter_group_size,
+            self.filter_trend_ema_period * self.filter_group_size,
+            (self.filter_rsi_period + 1) * self.filter_group_size,
+            (self.filter_volatility_period + 1) * self.filter_group_size,
+            self.exec_bollinger_period + 1,
+            self.exec_rsi_period + 1,
+            self.exec_volatility_period + 1,
+            self.trend_extension_ema_slow_period + 1,
+        )
+
+
+@dataclass
 class RegimeSwitchConfig:
     regime_ema_period: int = 50
     regime_slope_ema_period: int = 20
@@ -161,6 +212,7 @@ StrategyConfig = Union[
     MeanReversionConfig,
     MultiFactorConfig,
     MultiTimeframeMeanReversionConfig,
+    MultiTimeframeMeanReversionV2Config,
     RegimeSwitchConfig,
 ]
 StrategyEvaluator = Callable[
@@ -894,6 +946,234 @@ def _mtf_mean_reversion_evaluate(
     return StrategyDecision("HOLD", "no_entry", debug)
 
 
+def _mtf_mean_reversion_v2_evaluate(
+    recent_closes: Sequence[float],
+    in_position: bool,
+    entry_price: Optional[float],
+    cooldown_remaining: int,
+    bars_since_entry: int,
+    position_context: Optional[Dict[str, Any]],
+    config: StrategyConfig,
+) -> StrategyDecision:
+    if not isinstance(config, MultiTimeframeMeanReversionV2Config):
+        raise TypeError("MTF mean reversion v2 requires MultiTimeframeMeanReversionV2Config.")
+
+    if len(recent_closes) < config.required_history:
+        return StrategyDecision(
+            signal="HOLD",
+            reason="insufficient_data",
+            debug={"history_length": len(recent_closes), "required_history": config.required_history},
+        )
+
+    current_price = recent_closes[-1]
+    previous_price = recent_closes[-2]
+    filter_closes = aggregate_closes(recent_closes, config.filter_group_size)
+    if len(filter_closes) < max(
+        config.filter_bollinger_period + 1,
+        config.filter_trend_ema_period,
+        config.filter_rsi_period + 1,
+        config.filter_volatility_period + 1,
+    ):
+        return StrategyDecision(
+            signal="HOLD",
+            reason="insufficient_filter_data",
+            debug={
+                "history_length": len(recent_closes),
+                "filter_history_length": len(filter_closes),
+                "required_filter_history": max(
+                    config.filter_bollinger_period + 1,
+                    config.filter_trend_ema_period,
+                    config.filter_rsi_period + 1,
+                    config.filter_volatility_period + 1,
+                ),
+            },
+        )
+
+    filter_price = filter_closes[-1]
+    filter_ema_value = ema(filter_closes, config.filter_trend_ema_period)
+    filter_rsi_value = rsi(filter_closes, config.filter_rsi_period)
+    filter_volatility_value = realized_volatility(filter_closes, config.filter_volatility_period)
+    filter_middle_band, filter_lower_band, filter_upper_band = bollinger_bands(
+        filter_closes,
+        config.filter_bollinger_period,
+        config.filter_bollinger_stddev,
+    )
+
+    exec_rsi_value = rsi(recent_closes, config.exec_rsi_period)
+    exec_volatility_value = realized_volatility(recent_closes, config.exec_volatility_period)
+    exec_middle_band, exec_lower_band, exec_upper_band = bollinger_bands(
+        recent_closes,
+        config.exec_bollinger_period,
+        config.exec_bollinger_stddev,
+    )
+    _, previous_exec_lower_band, _ = bollinger_bands(
+        recent_closes[:-1],
+        config.exec_bollinger_period,
+        config.exec_bollinger_stddev,
+    )
+    trend_extension_ema_fast = ema(recent_closes, config.trend_extension_ema_fast_period)
+    trend_extension_ema_slow = ema(recent_closes, config.trend_extension_ema_slow_period)
+
+    if (
+        filter_ema_value is None
+        or filter_rsi_value is None
+        or filter_volatility_value is None
+        or filter_middle_band is None
+        or filter_lower_band is None
+        or filter_upper_band is None
+        or exec_rsi_value is None
+        or exec_volatility_value is None
+        or exec_middle_band is None
+        or exec_lower_band is None
+        or exec_upper_band is None
+        or previous_exec_lower_band is None
+        or trend_extension_ema_fast is None
+        or trend_extension_ema_slow is None
+    ):
+        return StrategyDecision(
+            signal="HOLD",
+            reason="indicators_unavailable",
+            debug={"history_length": len(recent_closes), "filter_history_length": len(filter_closes)},
+        )
+
+    filter_distance_to_mid_pct = ((filter_middle_band - filter_price) / filter_price) if filter_price > 0 else 0.0
+    required_filter_distance_to_mid_pct = _required_edge_pct(
+        config.filter_min_distance_to_mid_pct,
+        config.assumed_round_trip_cost_pct,
+        config.minimum_edge_to_cost_ratio,
+    )
+    filter_allow_trade = (
+        filter_price >= filter_ema_value * (1 - config.filter_entry_below_trend_ema_buffer_pct)
+        and filter_volatility_value <= config.filter_max_volatility
+        and filter_distance_to_mid_pct >= required_filter_distance_to_mid_pct
+    )
+    filter_risk_off = (
+        filter_volatility_value > config.filter_max_volatility
+        or filter_price < filter_ema_value * (1 - config.filter_entry_below_trend_ema_buffer_pct)
+    )
+
+    bounced_from_exec_lower_band = previous_price < previous_exec_lower_band and current_price >= exec_lower_band
+    near_exec_lower_band = current_price <= exec_lower_band * (1 + config.exec_lower_band_entry_buffer_pct)
+    exec_entry_ready = (
+        (bounced_from_exec_lower_band or near_exec_lower_band)
+        and exec_rsi_value <= config.exec_rsi_entry_threshold
+        and exec_volatility_value <= config.exec_max_volatility
+    )
+
+    previous_in_trend_mode = bool((position_context or {}).get("in_trend_mode", False))
+    trend_trigger = (
+        config.trend_extension_enabled
+        and in_position
+        and current_price > trend_extension_ema_slow
+        and trend_extension_ema_fast > trend_extension_ema_slow
+        and exec_rsi_value > config.trend_extension_rsi_threshold
+    )
+    in_trend_mode = in_position and (previous_in_trend_mode or trend_trigger)
+
+    debug = {
+        "strategy_name": "mtf_mean_reversion_v2",
+        "base_candle_minutes": config.base_candle_minutes,
+        "filter_candle_minutes": config.filter_candle_minutes,
+        "filter_group_size": config.filter_group_size,
+        "current_price_5m": current_price,
+        "filter_price_15m": filter_price,
+        "filter_allow_trade": filter_allow_trade,
+        "filter_risk_off": filter_risk_off,
+        "filter_ema_15m": filter_ema_value,
+        "filter_middle_band_15m": filter_middle_band,
+        "filter_lower_band_15m": filter_lower_band,
+        "filter_upper_band_15m": filter_upper_band,
+        "filter_rsi_15m": filter_rsi_value,
+        "filter_volatility_15m": filter_volatility_value,
+        "filter_distance_to_mid_pct": round(filter_distance_to_mid_pct, 4),
+        "required_filter_distance_to_mid_pct": round(required_filter_distance_to_mid_pct, 4),
+        "exec_middle_band_5m": exec_middle_band,
+        "exec_lower_band_5m": exec_lower_band,
+        "exec_upper_band_5m": exec_upper_band,
+        "exec_rsi_5m": exec_rsi_value,
+        "exec_volatility_5m": exec_volatility_value,
+        "exec_max_volatility": config.exec_max_volatility,
+        "bounced_from_exec_lower_band": bounced_from_exec_lower_band,
+        "near_exec_lower_band": near_exec_lower_band,
+        "exec_entry_ready": exec_entry_ready,
+        "bars_since_entry": bars_since_entry,
+        "trend_extension_ema_fast_5m": trend_extension_ema_fast,
+        "trend_extension_ema_slow_5m": trend_extension_ema_slow,
+        "trend_extension_rsi_threshold": config.trend_extension_rsi_threshold,
+        "trend_trigger": trend_trigger,
+        "previous_in_trend_mode": previous_in_trend_mode,
+        "in_trend_mode": in_trend_mode,
+    }
+
+    if in_position and entry_price is not None:
+        stop_price = entry_price * (1 - config.stop_loss_pct)
+        take_profit_price = entry_price * (1 + config.take_profit_pct)
+        window_size = min(len(recent_closes), max(1, bars_since_entry + 1))
+        highest_price_since_entry = max(recent_closes[-window_size:])
+        trailing_stop_price = trailing_stop_level(
+            highest_price_since_entry,
+            config.trend_extension_trailing_stop_pct,
+        )
+        debug["stop_loss_level"] = stop_price
+        debug["take_profit_level"] = take_profit_price
+        debug["minimum_hold_bars"] = config.minimum_hold_bars
+        debug["middle_band_exit_level"] = exec_middle_band
+        debug["trend_extension_trailing_stop_level"] = trailing_stop_price
+
+        if current_price <= stop_price:
+            return StrategyDecision("SELL", "stop_loss", debug)
+
+        if filter_risk_off:
+            return StrategyDecision("SELL", "higher_timeframe_risk_off_exit", debug)
+
+        if config.trend_extension_enabled and in_trend_mode:
+            if trend_extension_ema_fast < trend_extension_ema_slow:
+                return StrategyDecision("SELL", "trend_extension_ema_fast_below_slow", debug)
+
+            if current_price <= trailing_stop_price:
+                return StrategyDecision("SELL", "trend_extension_trailing_stop_hit", debug)
+
+            return StrategyDecision("HOLD", "holding_trend_extension", debug)
+
+        if current_price >= take_profit_price:
+            return StrategyDecision("SELL", "take_profit", debug)
+
+        if bars_since_entry >= config.minimum_hold_bars and current_price >= exec_middle_band:
+            return StrategyDecision("SELL", "mean_reversion_exit", debug)
+
+        if bars_since_entry >= config.minimum_hold_bars and exec_rsi_value >= config.exec_rsi_exit_threshold:
+            return StrategyDecision("SELL", "rsi_exit", debug)
+
+        return StrategyDecision("HOLD", "holding_position", debug)
+
+    if cooldown_remaining > 0:
+        return StrategyDecision("HOLD", "cooldown", debug)
+
+    if not filter_allow_trade:
+        return StrategyDecision("HOLD", "filter_trade_not_allowed", debug)
+
+    if exec_volatility_value > config.exec_max_volatility:
+        return StrategyDecision("HOLD", "exec_volatility_too_high", debug)
+
+    if not exec_entry_ready:
+        return StrategyDecision("HOLD", "no_entry", debug)
+
+    if bounced_from_exec_lower_band:
+        return StrategyDecision(
+            "BUY",
+            "5m_lower_band_bounce_with_15m_filter",
+            debug,
+            buy_fraction_pct_override=config.strong_buy_fraction_pct,
+        )
+
+    return StrategyDecision(
+        "BUY",
+        "5m_near_lower_band_with_15m_filter",
+        debug,
+        buy_fraction_pct_override=config.strong_buy_fraction_pct,
+    )
+
+
 def _regime_switch_evaluate(
     recent_closes: Sequence[float],
     in_position: bool,
@@ -1108,6 +1388,61 @@ def build_mtf_mean_reversion_strategy() -> Strategy:
     )
 
 
+def build_mtf_mean_reversion_v2_strategy() -> Strategy:
+    config = MultiTimeframeMeanReversionV2Config(
+        base_candle_minutes=int(os.getenv("ROOSTOO_MTF_V2_BASE_CANDLE_MINUTES", "5")),
+        filter_candle_minutes=int(os.getenv("ROOSTOO_MTF_V2_FILTER_CANDLE_MINUTES", "15")),
+        filter_bollinger_period=int(os.getenv("ROOSTOO_MTF_V2_FILTER_BOLLINGER_PERIOD", "20")),
+        filter_bollinger_stddev=float(os.getenv("ROOSTOO_MTF_V2_FILTER_BOLLINGER_STDDEV", "2.0")),
+        filter_trend_ema_period=int(os.getenv("ROOSTOO_MTF_V2_FILTER_TREND_EMA_PERIOD", "50")),
+        filter_rsi_period=int(os.getenv("ROOSTOO_MTF_V2_FILTER_RSI_PERIOD", "14")),
+        filter_volatility_period=int(os.getenv("ROOSTOO_MTF_V2_FILTER_VOLATILITY_PERIOD", "20")),
+        filter_max_volatility=float(os.getenv("ROOSTOO_MTF_V2_FILTER_MAX_VOLATILITY", "0.013")),
+        filter_min_distance_to_mid_pct=float(
+            os.getenv("ROOSTOO_MTF_V2_FILTER_MIN_DISTANCE_TO_MID_PCT", "0.009")
+        ),
+        filter_entry_below_trend_ema_buffer_pct=float(
+            os.getenv("ROOSTOO_MTF_V2_FILTER_ENTRY_BELOW_TREND_EMA_BUFFER_PCT", "0.005")
+        ),
+        exec_bollinger_period=int(os.getenv("ROOSTOO_MTF_V2_EXEC_BOLLINGER_PERIOD", "20")),
+        exec_bollinger_stddev=float(os.getenv("ROOSTOO_MTF_V2_EXEC_BOLLINGER_STDDEV", "2.0")),
+        exec_rsi_period=int(os.getenv("ROOSTOO_MTF_V2_EXEC_RSI_PERIOD", "14")),
+        exec_rsi_entry_threshold=float(os.getenv("ROOSTOO_MTF_V2_EXEC_RSI_ENTRY_THRESHOLD", "28")),
+        exec_rsi_exit_threshold=float(os.getenv("ROOSTOO_MTF_V2_EXEC_RSI_EXIT_THRESHOLD", "58")),
+        exec_volatility_period=int(os.getenv("ROOSTOO_MTF_V2_EXEC_VOLATILITY_PERIOD", "20")),
+        exec_max_volatility=float(os.getenv("ROOSTOO_MTF_V2_EXEC_MAX_VOLATILITY", "0.010")),
+        exec_lower_band_entry_buffer_pct=float(
+            os.getenv("ROOSTOO_MTF_V2_EXEC_LOWER_BAND_ENTRY_BUFFER_PCT", "0.002")
+        ),
+        stop_loss_pct=float(os.getenv("ROOSTOO_MTF_V2_STOP_LOSS_PCT", "0.007")),
+        take_profit_pct=float(os.getenv("ROOSTOO_MTF_V2_TAKE_PROFIT_PCT", "0.011")),
+        cooldown_periods=int(os.getenv("ROOSTOO_MTF_V2_COOLDOWN_PERIODS", "4")),
+        minimum_hold_bars=int(os.getenv("ROOSTOO_MTF_V2_MINIMUM_HOLD_BARS", "3")),
+        strong_buy_fraction_pct=float(os.getenv("ROOSTOO_MTF_V2_STRONG_BUY_FRACTION_PCT", "0.08")),
+        assumed_round_trip_cost_pct=float(
+            os.getenv("ROOSTOO_MTF_V2_ASSUMED_ROUND_TRIP_COST_PCT", "0.0025")
+        ),
+        minimum_edge_to_cost_ratio=float(os.getenv("ROOSTOO_MTF_V2_MIN_EDGE_TO_COST_RATIO", "1.5")),
+        trend_extension_enabled=_to_bool(
+            os.getenv("ROOSTOO_MTF_V2_TREND_EXTENSION_ENABLED", "true"),
+            default=True,
+        ),
+        trend_extension_ema_fast_period=int(os.getenv("ROOSTOO_MTF_V2_TREND_EXTENSION_EMA_FAST_PERIOD", "9")),
+        trend_extension_ema_slow_period=int(os.getenv("ROOSTOO_MTF_V2_TREND_EXTENSION_EMA_SLOW_PERIOD", "21")),
+        trend_extension_rsi_threshold=float(
+            os.getenv("ROOSTOO_MTF_V2_TREND_EXTENSION_RSI_THRESHOLD", "55")
+        ),
+        trend_extension_trailing_stop_pct=float(
+            os.getenv("ROOSTOO_MTF_V2_TREND_EXTENSION_TRAILING_STOP_PCT", "0.009")
+        ),
+    )
+    return Strategy(
+        name="mtf_mean_reversion_v2",
+        config=config,
+        evaluator=_mtf_mean_reversion_v2_evaluate,
+    )
+
+
 def build_regime_switch_strategy() -> Strategy:
     config = RegimeSwitchConfig(
         regime_ema_period=int(os.getenv("ROOSTOO_REGIME_EMA_PERIOD", "50")),
@@ -1144,6 +1479,7 @@ STRATEGY_BUILDERS: Dict[str, Callable[[], Strategy]] = {
     "mean_reversion": build_mean_reversion_strategy,
     "multi_factor": build_multifactor_strategy,
     "mtf_mean_reversion": build_mtf_mean_reversion_strategy,
+    "mtf_mean_reversion_v2": build_mtf_mean_reversion_v2_strategy,
     "regime_switch": build_regime_switch_strategy,
 }
 

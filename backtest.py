@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from portfolio import (
+    POSITION_EPSILON,
     PairPositionState,
     PortfolioConfig,
     PortfolioState,
@@ -27,6 +28,15 @@ from portfolio import (
     shared_position_value,
     shared_total_equity,
     total_equity,
+)
+from daily_trade import (
+    DailyTradeRequirementState,
+    build_daily_trade_requirement_config_from_env,
+    daily_trade_fallback_due,
+    mark_daily_trade_executed,
+    mark_daily_trade_fallback_attempted,
+    parse_utc_timestamp,
+    roll_daily_trade_state,
 )
 from strategy import Strategy, build_strategy_from_env, evaluate_strategy
 
@@ -186,6 +196,22 @@ def load_price_bars(csv_path: str) -> List[PriceBar]:
     return bars
 
 
+def _effective_dust_notional_threshold(portfolio_config: PortfolioConfig) -> float:
+    configured_threshold = max(
+        portfolio_config.min_trade_notional,
+        portfolio_config.dust_trade_notional,
+    )
+    return configured_threshold if configured_threshold > 0 else 1.0
+
+
+def _is_backtest_dust_position(units: float, price: Optional[float], portfolio_config: PortfolioConfig) -> bool:
+    if units <= POSITION_EPSILON:
+        return True
+    if price is None or price <= 0:
+        return False
+    return units * price < _effective_dust_notional_threshold(portfolio_config)
+
+
 def run_backtest(
     bars: Sequence[PriceBar],
     starting_cash: float = 10_000.0,
@@ -202,6 +228,9 @@ def run_backtest(
 
     strategy = strategy or build_strategy_from_env()
     portfolio_config = portfolio_config or build_portfolio_config_from_env()
+    daily_trade_config = build_daily_trade_requirement_config_from_env(None)
+    if daily_trade_config.fallback_pair is None:
+        daily_trade_config.fallback_pair = "BTC/USD"
     portfolio_state = PortfolioState(cash_balance=starting_cash)
     entry_timestamp: Optional[str] = None
     completed_trades: List[CompletedTrade] = []
@@ -219,8 +248,11 @@ def run_backtest(
     trade_records: List[Dict[str, object]] = []
     timeseries_records: List[Dict[str, object]] = []
     position_context: Dict[str, object] = {"in_trend_mode": False}
+    daily_trade_state = DailyTradeRequirementState()
 
     for bar in bars:
+        current_time_utc = parse_utc_timestamp(bar.timestamp)
+        daily_trade_state = roll_daily_trade_state(daily_trade_state, current_time_utc)
         recent_closes.append(bar.close)
         decision = evaluate_strategy(
             recent_closes,
@@ -260,6 +292,7 @@ def run_backtest(
                     cooldown_remaining = 0
                     executed_buys += 1
                     action_taken = "BUY"
+                    daily_trade_state = mark_daily_trade_executed(daily_trade_state, current_time_utc)
                     if include_trade_records:
                         trade_records.append(
                             {
@@ -310,6 +343,7 @@ def run_backtest(
                         )
                         executed_sells += 1
                         action_taken = "SELL"
+                        daily_trade_state = mark_daily_trade_executed(daily_trade_state, current_time_utc)
                         if include_trade_records:
                             trade_records.append(
                                 {
@@ -338,6 +372,99 @@ def run_backtest(
                             cooldown_remaining = strategy.config.cooldown_periods
         elif cooldown_remaining > 0:
             cooldown_remaining -= 1
+
+        if daily_trade_fallback_due(daily_trade_config, daily_trade_state, current_time_utc):
+            daily_trade_state = mark_daily_trade_fallback_attempted(daily_trade_state, current_time_utc)
+            fallback_signal = (
+                "SELL"
+                if not _is_backtest_dust_position(portfolio_state.position_units, bar.close, portfolio_config)
+                else "BUY"
+            )
+            if fallback_signal == "BUY":
+                buy_signals += 1
+                fallback_notional = compute_buy_notional(
+                    portfolio_state,
+                    bar.close,
+                    portfolio_config,
+                    buy_fraction_pct_override=daily_trade_config.fallback_buy_fraction_pct,
+                )
+                if fallback_notional > 0:
+                    execution = apply_buy(portfolio_state, bar.close, fee_rate, fallback_notional)
+                    if execution is not None:
+                        if entry_timestamp is None:
+                            entry_timestamp = bar.timestamp
+                            bars_since_entry = 0
+                        cooldown_remaining = 0
+                        executed_buys += 1
+                        action_taken = "FORCED_BUY"
+                        daily_trade_state = mark_daily_trade_executed(daily_trade_state, current_time_utc)
+                        if include_trade_records:
+                            trade_records.append(
+                                {
+                                    "timestamp": bar.timestamp,
+                                    "side": "BUY",
+                                    "signal_reason": "daily_trade_fallback_buy",
+                                    "price": bar.close,
+                                    "quantity": execution.quantity,
+                                    "notional": execution.notional,
+                                    "fee_paid": execution.fee_paid,
+                                    "buy_fraction_pct_multiplier": None,
+                                    "portfolio_cash_after": portfolio_state.cash_balance,
+                                    "portfolio_units_after": portfolio_state.position_units,
+                                    "portfolio_equity_after": total_equity(portfolio_state, bar.close),
+                                    "average_entry_price_after": portfolio_state.average_entry_price,
+                                    "strategy": strategy.name,
+                                    "strategy_debug": {"daily_trade_fallback": True},
+                                }
+                            )
+            else:
+                sell_signals += 1
+                units_to_sell = compute_sell_units(portfolio_state, bar.close, portfolio_config)
+                if units_to_sell > 0:
+                    execution = apply_sell(portfolio_state, bar.close, fee_rate, units_to_sell)
+                    if execution is not None:
+                        completed_trades.append(
+                            CompletedTrade(
+                                entry_timestamp=entry_timestamp or bar.timestamp,
+                                exit_timestamp=bar.timestamp,
+                                quantity=execution.quantity,
+                                entry_price=execution.average_entry_price or bar.close,
+                                exit_price=bar.close,
+                                notional=execution.notional,
+                                realized_pnl=execution.realized_pnl,
+                                return_pct=execution.return_pct,
+                                exit_reason="daily_trade_fallback_sell",
+                            )
+                        )
+                        executed_sells += 1
+                        action_taken = "FORCED_SELL"
+                        daily_trade_state = mark_daily_trade_executed(daily_trade_state, current_time_utc)
+                        if include_trade_records:
+                            trade_records.append(
+                                {
+                                    "timestamp": bar.timestamp,
+                                    "side": "SELL",
+                                    "signal_reason": "daily_trade_fallback_sell",
+                                    "price": bar.close,
+                                    "quantity": execution.quantity,
+                                    "notional": execution.notional,
+                                    "fee_paid": execution.fee_paid,
+                                    "realized_pnl": execution.realized_pnl,
+                                    "return_pct": execution.return_pct,
+                                    "position_fully_closed": execution.position_fully_closed,
+                                    "portfolio_cash_after": portfolio_state.cash_balance,
+                                    "portfolio_units_after": portfolio_state.position_units,
+                                    "portfolio_equity_after": total_equity(portfolio_state, bar.close),
+                                    "average_entry_price_after": portfolio_state.average_entry_price,
+                                    "strategy": strategy.name,
+                                    "strategy_debug": {"daily_trade_fallback": True},
+                                }
+                            )
+                        if execution.position_fully_closed:
+                            entry_timestamp = None
+                            bars_since_entry = 0
+                            position_context["in_trend_mode"] = False
+                            cooldown_remaining = strategy.config.cooldown_periods
 
         if portfolio_state.position_units > 0:
             bars_since_entry += 1
@@ -470,6 +597,8 @@ def run_multi_asset_backtest(
 
     strategy = strategy or build_strategy_from_env()
     portfolio_config = portfolio_config or build_portfolio_config_from_env()
+    default_fallback_pair = infer_pair_from_csv_path(csv_paths[0]) if csv_paths else None
+    daily_trade_config = build_daily_trade_requirement_config_from_env(default_fallback_pair)
 
     pair_bars: Dict[str, List[PriceBar]] = {}
     for csv_path in csv_paths:
@@ -503,8 +632,11 @@ def run_multi_asset_backtest(
     timeseries_records: List[Dict[str, object]] = []
     peak_equity = starting_cash
     max_drawdown_pct = 0.0
+    daily_trade_state = DailyTradeRequirementState()
 
     for timestamp in timestamps:
+        current_time_utc = parse_utc_timestamp(timestamp)
+        daily_trade_state = roll_daily_trade_state(daily_trade_state, current_time_utc)
         active_pairs: List[tuple[str, PriceBar]] = []
         for pair, bars in pair_bars.items():
             index = indices[pair]
@@ -590,6 +722,7 @@ def run_multi_asset_backtest(
             )
             state["executed_sells"] = int(state["executed_sells"]) + 1
             pair_actions[pair] = "SELL"
+            daily_trade_state = mark_daily_trade_executed(daily_trade_state, current_time_utc)
 
             if include_trade_records:
                 trade_records.append(
@@ -672,6 +805,7 @@ def run_multi_asset_backtest(
             state["cooldown_remaining"] = 0
             state["executed_buys"] = int(state["executed_buys"]) + 1
             pair_actions[pair] = "BUY"
+            daily_trade_state = mark_daily_trade_executed(daily_trade_state, current_time_utc)
 
             if include_trade_records:
                 trade_records.append(
@@ -699,6 +833,154 @@ def run_multi_asset_backtest(
                         "strategy_debug": decision.debug,
                     }
                 )
+
+        if daily_trade_fallback_due(daily_trade_config, daily_trade_state, current_time_utc):
+            fallback_pair = daily_trade_config.fallback_pair
+            if fallback_pair in latest_prices:
+                fallback_price = latest_prices[fallback_pair]
+                fallback_state = pair_states[fallback_pair]
+                fallback_position = get_pair_position_state(portfolio_state, fallback_pair)
+                daily_trade_state = mark_daily_trade_fallback_attempted(daily_trade_state, current_time_utc)
+                fallback_signal = (
+                    "SELL"
+                    if not _is_backtest_dust_position(
+                        fallback_position.position_units,
+                        fallback_price,
+                        portfolio_config,
+                    )
+                    else "BUY"
+                )
+                if fallback_signal == "BUY":
+                    fallback_state["buy_signals"] = int(fallback_state["buy_signals"]) + 1
+                    fallback_notional = shared_compute_buy_notional(
+                        portfolio_state,
+                        fallback_pair,
+                        fallback_price,
+                        latest_prices,
+                        portfolio_config,
+                        buy_fraction_pct_override=daily_trade_config.fallback_buy_fraction_pct,
+                        buy_fraction_pct_multiplier=1.0,
+                    )
+                    if fallback_notional > 0:
+                        execution = shared_apply_buy(
+                            portfolio_state,
+                            fallback_pair,
+                            fallback_price,
+                            fee_rate,
+                            fallback_notional,
+                        )
+                        if execution is not None:
+                            if fallback_state.get("entry_timestamp") is None:
+                                fallback_state["entry_timestamp"] = timestamp
+                            fallback_state["cooldown_remaining"] = 0
+                            fallback_state["executed_buys"] = int(fallback_state["executed_buys"]) + 1
+                            pair_actions[fallback_pair] = "FORCED_BUY"
+                            daily_trade_state = mark_daily_trade_executed(daily_trade_state, current_time_utc)
+                            if include_trade_records:
+                                trade_records.append(
+                                    {
+                                        "timestamp": timestamp,
+                                        "pair": fallback_pair,
+                                        "side": "BUY",
+                                        "signal_reason": "daily_trade_fallback_buy",
+                                        "price": fallback_price,
+                                        "quantity": execution.quantity,
+                                        "notional": execution.notional,
+                                        "fee_paid": execution.fee_paid,
+                                        "portfolio_cash_after": portfolio_state.cash_balance,
+                                        "portfolio_equity_after": shared_total_equity(portfolio_state, latest_prices),
+                                        "pair_position_value_after": shared_position_value(
+                                            portfolio_state,
+                                            fallback_pair,
+                                            fallback_price,
+                                        ),
+                                        "pair_allocation_pct_after": shared_allocation_pct(
+                                            portfolio_state,
+                                            fallback_pair,
+                                            latest_prices,
+                                        )
+                                        * 100,
+                                        "average_entry_price_after": get_pair_position_state(
+                                            portfolio_state,
+                                            fallback_pair,
+                                        ).average_entry_price,
+                                        "strategy": strategy.name,
+                                        "strategy_debug": {"daily_trade_fallback": True},
+                                    }
+                                )
+                else:
+                    fallback_state["sell_signals"] = int(fallback_state["sell_signals"]) + 1
+                    units_to_sell = shared_compute_sell_units(
+                        portfolio_state,
+                        fallback_pair,
+                        fallback_price,
+                        portfolio_config,
+                    )
+                    if units_to_sell > 0:
+                        execution = shared_apply_sell(
+                            portfolio_state,
+                            fallback_pair,
+                            fallback_price,
+                            fee_rate,
+                            units_to_sell,
+                        )
+                        if execution is not None:
+                            completed_trades.append(
+                                CompletedTrade(
+                                    entry_timestamp=str(fallback_state.get("entry_timestamp") or timestamp),
+                                    exit_timestamp=timestamp,
+                                    quantity=execution.quantity,
+                                    entry_price=execution.average_entry_price or fallback_price,
+                                    exit_price=fallback_price,
+                                    notional=execution.notional,
+                                    realized_pnl=execution.realized_pnl,
+                                    return_pct=execution.return_pct,
+                                    exit_reason="daily_trade_fallback_sell",
+                                )
+                            )
+                            fallback_state["executed_sells"] = int(fallback_state["executed_sells"]) + 1
+                            pair_actions[fallback_pair] = "FORCED_SELL"
+                            daily_trade_state = mark_daily_trade_executed(daily_trade_state, current_time_utc)
+                            if include_trade_records:
+                                trade_records.append(
+                                    {
+                                        "timestamp": timestamp,
+                                        "pair": fallback_pair,
+                                        "side": "SELL",
+                                        "signal_reason": "daily_trade_fallback_sell",
+                                        "price": fallback_price,
+                                        "quantity": execution.quantity,
+                                        "notional": execution.notional,
+                                        "fee_paid": execution.fee_paid,
+                                        "realized_pnl": execution.realized_pnl,
+                                        "return_pct": execution.return_pct,
+                                        "position_fully_closed": execution.position_fully_closed,
+                                        "portfolio_cash_after": portfolio_state.cash_balance,
+                                        "portfolio_equity_after": shared_total_equity(portfolio_state, latest_prices),
+                                        "pair_position_value_after": shared_position_value(
+                                            portfolio_state,
+                                            fallback_pair,
+                                            fallback_price,
+                                        ),
+                                        "pair_allocation_pct_after": shared_allocation_pct(
+                                            portfolio_state,
+                                            fallback_pair,
+                                            latest_prices,
+                                        )
+                                        * 100,
+                                        "average_entry_price_after": get_pair_position_state(
+                                            portfolio_state,
+                                            fallback_pair,
+                                        ).average_entry_price,
+                                        "strategy": strategy.name,
+                                        "strategy_debug": {"daily_trade_fallback": True},
+                                    }
+                                )
+                            if execution.position_fully_closed:
+                                fallback_state["entry_timestamp"] = None
+                                fallback_state["bars_since_entry"] = 0
+                                fallback_state["in_trend_mode"] = False
+                                fallback_state["cooldown_remaining"] = strategy.config.cooldown_periods
 
         for pair in sorted(pair_decisions):
             state = pair_decisions[pair]["state"]

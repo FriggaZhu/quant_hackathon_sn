@@ -22,6 +22,15 @@ from backtest import (
     write_trade_records_jsonl,
     write_timeseries_records_csv,
 )
+from daily_trade import (
+    DailyTradeRequirementState,
+    build_daily_trade_requirement_config_from_env,
+    daily_trade_fallback_due,
+    mark_daily_trade_executed,
+    mark_daily_trade_fallback_attempted,
+    parse_utc_timestamp,
+    roll_daily_trade_state,
+)
 from portfolio import (
     PairPositionState,
     PortfolioConfig,
@@ -74,6 +83,7 @@ TRADE_HISTORY_FILE = LOG_DIR / "trade_history.jsonl"
 EXECUTION_HISTORY_FILE = LOG_DIR / "execution_history.jsonl"
 STARTING_BALANCE_FILE = LOG_DIR / "starting_wallet.json"
 PORTFOLIO_STATE_FILE = LOG_DIR / "portfolio_state.json"
+DAILY_TRADE_STATE_FILE = LOG_DIR / "daily_trade_state.json"
 BACKTEST_LATEST_SUMMARY_FILE = BACKTEST_SUMMARY_DIR / "backtest_latest_summary.json"
 BACKTEST_HISTORY_JSONL_FILE = BACKTEST_SUMMARY_DIR / "backtest_runs.jsonl"
 BACKTEST_HISTORY_CSV_FILE = BACKTEST_SUMMARY_DIR / "backtest_runs.csv"
@@ -81,6 +91,7 @@ BACKTEST_INITIAL_CASH = float(os.getenv("ROOSTOO_BACKTEST_INITIAL_CASH", "10000"
 BACKTEST_FEE_RATE = float(os.getenv("ROOSTOO_BACKTEST_FEE_RATE", "0.001"))
 ACTIVE_STRATEGY: Strategy = build_strategy_from_env()
 PORTFOLIO_CONFIG: PortfolioConfig = build_portfolio_config_from_env()
+DAILY_TRADE_REQUIREMENT_CONFIG = build_daily_trade_requirement_config_from_env(PAIR)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -234,6 +245,28 @@ def load_starting_wallet() -> Optional[Dict[str, float]]:
     return summary
 
 
+def save_daily_trade_state(state: DailyTradeRequirementState) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    with DAILY_TRADE_STATE_FILE.open("w", encoding="utf-8") as file_handle:
+        json.dump(state.to_dict(), file_handle, indent=2, sort_keys=True)
+
+
+def load_daily_trade_state() -> DailyTradeRequirementState:
+    if not DAILY_TRADE_STATE_FILE.exists():
+        return DailyTradeRequirementState()
+
+    with DAILY_TRADE_STATE_FILE.open("r", encoding="utf-8") as file_handle:
+        raw_data = json.load(file_handle)
+
+    if not isinstance(raw_data, dict):
+        return DailyTradeRequirementState()
+
+    try:
+        return DailyTradeRequirementState.from_dict(raw_data)
+    except (TypeError, ValueError):
+        return DailyTradeRequirementState()
+
+
 def save_portfolio_state(
     portfolio_state: PortfolioState,
     cooldown_remaining: int,
@@ -367,6 +400,8 @@ def initialize_portfolio_state(
     base_asset, quote_asset = parse_pair_assets(PAIR)
     cash_balance = wallet.get(quote_asset, 0.0)
     position_units = wallet.get(base_asset, 0.0)
+    if _is_wallet_dust_position(position_units, price):
+        position_units = 0.0
     average_entry_price = price if position_units > POSITION_EPSILON else None
     return PortfolioState(
         cash_balance=cash_balance,
@@ -387,7 +422,14 @@ def sync_portfolio_state_with_wallet(
     portfolio_state.cash_balance = wallet.get(quote_asset, portfolio_state.cash_balance)
     wallet_position_units = wallet.get(base_asset, portfolio_state.position_units)
 
-    if wallet_position_units <= POSITION_EPSILON:
+    if _is_wallet_dust_position(wallet_position_units, price):
+        if wallet_position_units > POSITION_EPSILON:
+            logger.info(
+                "Ignoring dust wallet position for %s: %.8f units (notional %.4f).",
+                PAIR,
+                wallet_position_units,
+                wallet_position_units * price,
+            )
         portfolio_state.position_units = 0.0
         portfolio_state.average_entry_price = None
         return
@@ -411,6 +453,8 @@ def initialize_shared_portfolio_state(
         if pair_quote_asset != quote_asset:
             raise ValueError("All configured pairs must share the same quote asset.")
         units = wallet.get(base_asset, 0.0)
+        if _is_wallet_dust_position(units, prices_by_pair.get(pair)):
+            units = 0.0
         positions[pair] = PairPositionState(
             position_units=units,
             average_entry_price=prices_by_pair.get(pair) if units > POSITION_EPSILON else None,
@@ -437,7 +481,15 @@ def sync_shared_portfolio_with_wallet(
         base_asset, _ = parse_pair_assets(pair)
         position = get_pair_position_state(portfolio_state, pair)
         wallet_units = wallet.get(base_asset, position.position_units)
-        if wallet_units <= POSITION_EPSILON:
+        pair_price = prices_by_pair.get(pair)
+        if _is_wallet_dust_position(wallet_units, pair_price):
+            if wallet_units > POSITION_EPSILON and pair_price is not None and pair_price > 0:
+                logger.info(
+                    "Ignoring dust wallet position for %s: %.8f units (notional %.4f).",
+                    pair,
+                    wallet_units,
+                    wallet_units * pair_price,
+                )
             position.position_units = 0.0
             position.average_entry_price = None
             continue
@@ -544,6 +596,22 @@ def extract_price(ticker_response: Dict[str, Any], pair: str) -> float:
             continue
 
     raise ValueError(f"Could not find a usable price in ticker response: {ticker_response}")
+
+
+def _effective_dust_notional_threshold() -> float:
+    configured_threshold = max(
+        PORTFOLIO_CONFIG.min_trade_notional,
+        PORTFOLIO_CONFIG.dust_trade_notional,
+    )
+    return configured_threshold if configured_threshold > 0 else 1.0
+
+
+def _is_wallet_dust_position(units: float, price: Optional[float]) -> bool:
+    if units <= POSITION_EPSILON:
+        return True
+    if price is None or price <= 0:
+        return False
+    return units * price < _effective_dust_notional_threshold()
 
 
 def _format_quantity_for_pair(client: RoostooClient, pair: str, quantity: float, price: float) -> Optional[tuple[float, str]]:
@@ -927,6 +995,7 @@ def run_single_asset_bot() -> None:
     price_history = deque(maxlen=history_size)
     starting_wallet: Optional[Dict[str, float]] = None
     portfolio_state, cooldown_remaining, in_trend_mode = load_portfolio_state()
+    daily_trade_state = load_daily_trade_state()
     bars_since_entry = 0
 
     logger.info("Starting Roostoo trading bot for %s", PAIR)
@@ -934,9 +1003,12 @@ def run_single_asset_bot() -> None:
     logger.info("Active strategy: %s", ACTIVE_STRATEGY.name)
     logger.info("Strategy config: %s", ACTIVE_STRATEGY.config)
     logger.info("Portfolio config: %s", PORTFOLIO_CONFIG)
+    logger.info("Daily trade requirement config: %s", DAILY_TRADE_REQUIREMENT_CONFIG)
 
     while True:
         try:
+            cycle_timestamp = datetime.now(timezone.utc)
+            daily_trade_state = roll_daily_trade_state(daily_trade_state, cycle_timestamp)
             balance_response = client.get_balance()
             current_wallet = summarize_wallet(extract_spot_wallet(balance_response))
             if starting_wallet is None:
@@ -996,6 +1068,46 @@ def run_single_asset_bot() -> None:
                 buy_fraction_pct_override=decision.buy_fraction_pct_override,
                 buy_fraction_pct_multiplier=buy_fraction_pct_multiplier if signal == "BUY" else None,
             )
+            if order_result.get("status") in {"dry_run", "placed"}:
+                daily_trade_state = mark_daily_trade_executed(daily_trade_state, cycle_timestamp)
+
+            fallback_order_result: Optional[Dict[str, Any]] = None
+            fallback_reason: Optional[str] = None
+            if daily_trade_fallback_due(
+                DAILY_TRADE_REQUIREMENT_CONFIG,
+                daily_trade_state,
+                cycle_timestamp,
+            ):
+                fallback_signal = (
+                    "SELL"
+                    if not _is_wallet_dust_position(portfolio_state.position_units, price)
+                    else "BUY"
+                )
+                fallback_reason = f"daily_trade_fallback_{fallback_signal.lower()}"
+                logger.info(
+                    "Applying daily trade fallback for %s at %s with signal %s because no trades have executed yet today.",
+                    PAIR,
+                    cycle_timestamp.isoformat(),
+                    fallback_signal,
+                )
+                fallback_order_result = maybe_place_order(
+                    client,
+                    PAIR,
+                    fallback_signal,
+                    price,
+                    portfolio_state,
+                    PORTFOLIO_CONFIG,
+                    buy_fraction_pct_override=(
+                        DAILY_TRADE_REQUIREMENT_CONFIG.fallback_buy_fraction_pct
+                        if fallback_signal == "BUY"
+                        else None
+                    ),
+                    buy_fraction_pct_multiplier=None,
+                )
+                daily_trade_state = mark_daily_trade_fallback_attempted(daily_trade_state, cycle_timestamp)
+                if fallback_order_result.get("status") in {"dry_run", "placed"}:
+                    daily_trade_state = mark_daily_trade_executed(daily_trade_state, cycle_timestamp)
+
             if signal == "BUY" and order_result.get("status") in {"dry_run", "placed"}:
                 if portfolio_state.position_units > 0 and bars_since_entry == 0:
                     bars_since_entry = 0
@@ -1008,6 +1120,16 @@ def run_single_asset_bot() -> None:
             elif cooldown_remaining > 0:
                 cooldown_remaining -= 1
 
+            if fallback_order_result is not None:
+                fallback_signal = fallback_order_result.get("side")
+                if fallback_signal == "BUY" and fallback_order_result.get("status") in {"dry_run", "placed"}:
+                    cooldown_remaining = 0
+                elif fallback_signal == "SELL" and fallback_order_result.get("status") in {"dry_run", "placed"}:
+                    if portfolio_state.position_units <= POSITION_EPSILON:
+                        bars_since_entry = 0
+                        in_trend_mode = False
+                        cooldown_remaining = ACTIVE_STRATEGY.config.cooldown_periods
+
             if portfolio_state.position_units > 0:
                 bars_since_entry += 1
             else:
@@ -1017,6 +1139,7 @@ def run_single_asset_bot() -> None:
             current_position_value = position_value(portfolio_state, price)
             current_allocation = allocation_pct(portfolio_state, price)
             save_portfolio_state(portfolio_state, cooldown_remaining, in_trend_mode=in_trend_mode)
+            save_daily_trade_state(daily_trade_state)
 
             append_trade_history(
                 {
@@ -1036,6 +1159,8 @@ def run_single_asset_bot() -> None:
                     "strategy_cooldown_remaining": cooldown_remaining,
                     "strategy_bars_since_entry": bars_since_entry,
                     "strategy_in_trend_mode": in_trend_mode,
+                    "daily_trade_requirement_config": DAILY_TRADE_REQUIREMENT_CONFIG.to_dict(),
+                    "daily_trade_state": daily_trade_state.to_dict(),
                     "portfolio_state": portfolio_state.to_dict(),
                     "portfolio_equity": current_equity,
                     "portfolio_position_value": current_position_value,
@@ -1044,12 +1169,13 @@ def run_single_asset_bot() -> None:
                     "wallet": current_wallet,
                     "wallet_change": wallet_change,
                     "order": order_result,
+                    "fallback_order": fallback_order_result,
                 }
             )
             if order_result.get("status") in {"dry_run", "placed"}:
                 append_execution_history(
                     {
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "timestamp": cycle_timestamp.isoformat(),
                         "pair": PAIR,
                         "price": price,
                         "signal": signal,
@@ -1057,6 +1183,8 @@ def run_single_asset_bot() -> None:
                         "strategy_name": ACTIVE_STRATEGY.name,
                         "strategy_debug": debug,
                         "portfolio_config": PORTFOLIO_CONFIG.to_dict(),
+                        "daily_trade_requirement_config": DAILY_TRADE_REQUIREMENT_CONFIG.to_dict(),
+                        "daily_trade_state": daily_trade_state.to_dict(),
                         "portfolio_state": portfolio_state.to_dict(),
                         "portfolio_equity": current_equity,
                         "portfolio_position_value": current_position_value,
@@ -1066,6 +1194,33 @@ def run_single_asset_bot() -> None:
                         "wallet": current_wallet,
                         "wallet_change": wallet_change,
                         "order": order_result,
+                    }
+                )
+            if fallback_order_result is not None and fallback_order_result.get("status") in {"dry_run", "placed"}:
+                append_execution_history(
+                    {
+                        "timestamp": cycle_timestamp.isoformat(),
+                        "pair": PAIR,
+                        "price": price,
+                        "signal": fallback_order_result.get("side"),
+                        "signal_reason": fallback_reason,
+                        "strategy_name": ACTIVE_STRATEGY.name,
+                        "strategy_debug": {
+                            "daily_trade_fallback": True,
+                            "executed_trades_today": daily_trade_state.executed_trades_today,
+                        },
+                        "portfolio_config": PORTFOLIO_CONFIG.to_dict(),
+                        "daily_trade_requirement_config": DAILY_TRADE_REQUIREMENT_CONFIG.to_dict(),
+                        "daily_trade_state": daily_trade_state.to_dict(),
+                        "portfolio_state": portfolio_state.to_dict(),
+                        "portfolio_equity": current_equity,
+                        "portfolio_position_value": current_position_value,
+                        "portfolio_allocation_pct": current_allocation * 100,
+                        "strategy_in_trend_mode": in_trend_mode,
+                        "buy_fraction_pct_multiplier": None,
+                        "wallet": current_wallet,
+                        "wallet_change": wallet_change,
+                        "order": fallback_order_result,
                     }
                 )
         except (RoostooAPIError, ValueError) as exc:
@@ -1078,6 +1233,7 @@ def run_single_asset_bot() -> None:
                     "error_type": exc.__class__.__name__,
                 }
             )
+            save_daily_trade_state(daily_trade_state)
         except KeyboardInterrupt:
             logger.info("Bot stopped by user.")
             raise
@@ -1091,6 +1247,7 @@ def run_single_asset_bot() -> None:
                     "error_type": exc.__class__.__name__,
                 }
             )
+            save_daily_trade_state(daily_trade_state)
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
@@ -1104,6 +1261,7 @@ def run_multi_asset_bot() -> None:
     }
     starting_wallet: Optional[Dict[str, float]] = None
     portfolio_state, pair_states = load_shared_portfolio_state()
+    daily_trade_state = load_daily_trade_state()
 
     for pair in CONFIGURED_PAIRS:
         pair_states.setdefault(pair, {"cooldown_remaining": 0, "bars_since_entry": 0, "in_trend_mode": False})
@@ -1113,9 +1271,12 @@ def run_multi_asset_bot() -> None:
     logger.info("Active strategy: %s", ACTIVE_STRATEGY.name)
     logger.info("Strategy config: %s", ACTIVE_STRATEGY.config)
     logger.info("Portfolio config: %s", PORTFOLIO_CONFIG)
+    logger.info("Daily trade requirement config: %s", DAILY_TRADE_REQUIREMENT_CONFIG)
 
     while True:
         try:
+            cycle_timestamp = datetime.now(timezone.utc)
+            daily_trade_state = roll_daily_trade_state(daily_trade_state, cycle_timestamp)
             balance_response = client.get_balance()
             current_wallet = summarize_wallet(extract_spot_wallet(balance_response))
             if starting_wallet is None:
@@ -1214,6 +1375,7 @@ def run_multi_asset_bot() -> None:
                 pair_outputs[pair]["order_result"] = order_result
 
                 if order_result.get("status") in {"dry_run", "placed"}:
+                    daily_trade_state = mark_daily_trade_executed(daily_trade_state, cycle_timestamp)
                     if get_pair_position_state(portfolio_state, pair).position_units <= POSITION_EPSILON:
                         pair_state["bars_since_entry"] = 0
                         pair_state["in_trend_mode"] = False
@@ -1264,7 +1426,64 @@ def run_multi_asset_bot() -> None:
                 }
 
                 if order_result.get("status") in {"dry_run", "placed"}:
+                    daily_trade_state = mark_daily_trade_executed(daily_trade_state, cycle_timestamp)
                     pair_state["cooldown_remaining"] = 0
+
+            if daily_trade_fallback_due(
+                DAILY_TRADE_REQUIREMENT_CONFIG,
+                daily_trade_state,
+                cycle_timestamp,
+            ):
+                fallback_pair = DAILY_TRADE_REQUIREMENT_CONFIG.fallback_pair or CONFIGURED_PAIRS[0]
+                if fallback_pair in CONFIGURED_PAIRS:
+                    fallback_price = prices_by_pair[fallback_pair]
+                    fallback_position = get_pair_position_state(portfolio_state, fallback_pair)
+                    fallback_pair_state = pair_states[fallback_pair]
+                    fallback_signal = (
+                        "SELL"
+                        if not _is_wallet_dust_position(fallback_position.position_units, fallback_price)
+                        else "BUY"
+                    )
+                    fallback_reason = f"daily_trade_fallback_{fallback_signal.lower()}"
+                    logger.info(
+                        "Applying daily trade fallback for %s at %s with signal %s because no trades have executed yet today.",
+                        fallback_pair,
+                        cycle_timestamp.isoformat(),
+                        fallback_signal,
+                    )
+                    fallback_order_result = maybe_place_shared_order(
+                        client,
+                        fallback_pair,
+                        fallback_signal,
+                        fallback_price,
+                        portfolio_state,
+                        prices_by_pair,
+                        PORTFOLIO_CONFIG,
+                        buy_fraction_pct_override=(
+                            DAILY_TRADE_REQUIREMENT_CONFIG.fallback_buy_fraction_pct
+                            if fallback_signal == "BUY"
+                            else None
+                        ),
+                        buy_fraction_pct_multiplier=None,
+                    )
+                    pair_outputs[fallback_pair]["fallback_order_result"] = fallback_order_result
+                    pair_outputs[fallback_pair]["fallback_reason"] = fallback_reason
+                    daily_trade_state = mark_daily_trade_fallback_attempted(daily_trade_state, cycle_timestamp)
+                    if fallback_order_result.get("status") in {"dry_run", "placed"}:
+                        daily_trade_state = mark_daily_trade_executed(daily_trade_state, cycle_timestamp)
+                        if fallback_signal == "BUY":
+                            fallback_pair_state["cooldown_remaining"] = 0
+                        elif get_pair_position_state(portfolio_state, fallback_pair).position_units <= POSITION_EPSILON:
+                            fallback_pair_state["bars_since_entry"] = 0
+                            fallback_pair_state["in_trend_mode"] = False
+                            fallback_pair_state["cooldown_remaining"] = ACTIVE_STRATEGY.config.cooldown_periods
+                else:
+                    logger.warning(
+                        "Daily trade fallback pair %s is not in configured pairs %s. Skipping fallback.",
+                        fallback_pair,
+                        CONFIGURED_PAIRS,
+                    )
+                    daily_trade_state = mark_daily_trade_fallback_attempted(daily_trade_state, cycle_timestamp)
 
             for pair in CONFIGURED_PAIRS:
                 decision = pair_decisions[pair]["decision"]
@@ -1291,7 +1510,7 @@ def run_multi_asset_bot() -> None:
 
                 append_trade_history(
                     {
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "timestamp": cycle_timestamp.isoformat(),
                         "pair": pair,
                         "all_pairs": CONFIGURED_PAIRS,
                         "price": price,
@@ -1309,6 +1528,8 @@ def run_multi_asset_bot() -> None:
                         "strategy_cooldown_remaining": int(pair_state["cooldown_remaining"]),
                         "strategy_bars_since_entry": int(pair_state["bars_since_entry"]),
                         "strategy_in_trend_mode": bool(pair_state.get("in_trend_mode", False)),
+                        "daily_trade_requirement_config": DAILY_TRADE_REQUIREMENT_CONFIG.to_dict(),
+                        "daily_trade_state": daily_trade_state.to_dict(),
                         "portfolio_state": portfolio_state.to_dict(),
                         "pair_position_state": get_pair_position_state(portfolio_state, pair).to_dict(),
                         "portfolio_equity": current_equity,
@@ -1321,12 +1542,14 @@ def run_multi_asset_bot() -> None:
                         "wallet": current_wallet,
                         "wallet_change": wallet_change,
                         "order": output["order_result"],
+                        "fallback_order": output.get("fallback_order_result"),
+                        "fallback_reason": output.get("fallback_reason"),
                     }
                 )
                 if output["order_result"].get("status") in {"dry_run", "placed"}:
                     append_execution_history(
                         {
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "timestamp": cycle_timestamp.isoformat(),
                             "pair": pair,
                             "all_pairs": CONFIGURED_PAIRS,
                             "price": price,
@@ -1335,6 +1558,8 @@ def run_multi_asset_bot() -> None:
                             "strategy_name": ACTIVE_STRATEGY.name,
                             "strategy_debug": decision.debug,
                             "portfolio_config": PORTFOLIO_CONFIG.to_dict(),
+                            "daily_trade_requirement_config": DAILY_TRADE_REQUIREMENT_CONFIG.to_dict(),
+                            "daily_trade_state": daily_trade_state.to_dict(),
                             "portfolio_state": portfolio_state.to_dict(),
                             "pair_position_state": get_pair_position_state(portfolio_state, pair).to_dict(),
                             "portfolio_equity": current_equity,
@@ -1350,8 +1575,41 @@ def run_multi_asset_bot() -> None:
                             "order": output["order_result"],
                         }
                     )
+                if output.get("fallback_order_result", {}).get("status") in {"dry_run", "placed"}:
+                    append_execution_history(
+                        {
+                            "timestamp": cycle_timestamp.isoformat(),
+                            "pair": pair,
+                            "all_pairs": CONFIGURED_PAIRS,
+                            "price": price,
+                            "signal": output["fallback_order_result"].get("side"),
+                            "signal_reason": output.get("fallback_reason"),
+                            "strategy_name": ACTIVE_STRATEGY.name,
+                            "strategy_debug": {
+                                "daily_trade_fallback": True,
+                                "executed_trades_today": daily_trade_state.executed_trades_today,
+                            },
+                            "portfolio_config": PORTFOLIO_CONFIG.to_dict(),
+                            "daily_trade_requirement_config": DAILY_TRADE_REQUIREMENT_CONFIG.to_dict(),
+                            "daily_trade_state": daily_trade_state.to_dict(),
+                            "portfolio_state": portfolio_state.to_dict(),
+                            "pair_position_state": get_pair_position_state(portfolio_state, pair).to_dict(),
+                            "portfolio_equity": current_equity,
+                            "pair_position_value": current_position_value,
+                            "pair_allocation_pct": current_allocation * 100,
+                            "strategy_in_trend_mode": bool(pair_state.get("in_trend_mode", False)),
+                            "buy_fraction_pct_multiplier": None,
+                            "volatility_buy_fraction_multiplier": None,
+                            "pair_rank_multiplier": None,
+                            "pair_ranking_score": None,
+                            "wallet": current_wallet,
+                            "wallet_change": wallet_change,
+                            "order": output["fallback_order_result"],
+                        }
+                    )
 
             save_shared_portfolio_state(portfolio_state, pair_states)
+            save_daily_trade_state(daily_trade_state)
         except (RoostooAPIError, ValueError) as exc:
             logger.exception("Bot cycle failed: %s", exc)
             append_trade_history(
@@ -1362,6 +1620,7 @@ def run_multi_asset_bot() -> None:
                     "error_type": exc.__class__.__name__,
                 }
             )
+            save_daily_trade_state(daily_trade_state)
         except KeyboardInterrupt:
             logger.info("Bot stopped by user.")
             raise
@@ -1375,6 +1634,7 @@ def run_multi_asset_bot() -> None:
                     "error_type": exc.__class__.__name__,
                 }
             )
+            save_daily_trade_state(daily_trade_state)
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
