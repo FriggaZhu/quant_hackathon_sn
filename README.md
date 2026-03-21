@@ -1,15 +1,15 @@
-# Roostoo Trading Bot (Beginner Version)
+# Roostoo Trading Bot
 
-Simple autonomous crypto trading bot for the Roostoo Mock Exchange.
+Multi-asset crypto trading bot for the Roostoo Mock Exchange with live execution, backtesting, portfolio controls, and strategy comparison tooling.
 
 ## Overview
 
-This project is a starter bot built for learning:
+This project now includes a competition-ready trading workflow with:
 
 - REST API integration
 - request signing with HMAC SHA256
-- a basic automated trading loop
-- simple strategy wiring and logging
+- live multi-asset execution
+- strategy configuration, backtesting, plotting, and experiment logging
 
 The bot:
 
@@ -195,7 +195,7 @@ While it runs, the bot now writes:
 
 - `logs/bot.log`: readable runtime log
 - `logs/trade_history.jsonl`: one JSON record per cycle with timestamp, price, signal, wallet snapshot, wallet change, and order result
-- `logs/starting_wallet.json`: the baseline wallet used for simple PnL comparison
+- `logs/starting_wallet.json`: the baseline wallet used for live PnL comparison
 
 You can watch the latest entries with:
 
@@ -324,11 +324,11 @@ The backtest now simulates a lightweight spot portfolio:
 - applies a fee on each buy and sell
 - tracks realized PnL, ending position value, and fees paid
 
-This keeps the model simple, but it is much closer to how you would manage a larger competition portfolio than an all-in/all-out switch.
+This keeps the execution model lightweight while still matching a more realistic competition portfolio workflow than an all-in/all-out bot.
 
 ## Strategy
 
-Current strategy: long-only Bollinger/RSI mean reversion
+Current deploy candidate: long-only Bollinger/RSI mean reversion with trend-extension exits and cross-asset ranking
 
 - entry looks for an oversold bounce back above the lower Bollinger Band
 - it can also buy when price is very near the lower band instead of requiring a perfect bounce
@@ -336,14 +336,15 @@ Current strategy: long-only Bollinger/RSI mean reversion
 - trades are skipped when the distance back to the middle band is too small to justify fees
 - entries can require a minimum edge over assumed round-trip costs to reduce churn
 - trades are skipped when price is too far from the longer-term trend EMA
-- exit happens on mean reversion to the middle band plus a small buffer, a later RSI recovery, stop loss, or take profit
-- the bot can scale into the position in multiple tranches when repeated dip signals appear
+- once a trade proves itself as a stronger move, it can switch into trend-extension mode and hold until EMA weakness or a trailing stop triggers the exit
+- normal exits still include mean reversion to the middle band plus a small buffer, later RSI recovery, stop loss, or take profit
+- the live candidate disables weak add-ons and uses top-1 ranking across BTC, ETH, and SOL
 - a minimum hold period prevents immediate churn right after entry
 - a cooldown delays re-entry after each sell to reduce churn
 
 Built-in strategies:
 
-- `mean_reversion`: Bollinger/RSI pullback entries with simple exits
+- `mean_reversion`: Bollinger/RSI pullback entries with configurable trend-extension exits
 - `mtf_mean_reversion`: mean-reversion entries gated by derived 1h and 4h trend filters
 - `multi_factor`: regime-aware trend-pullback scoring model
 - `regime_switch`: switches between trend-following and mean-reversion based on trend slope and volatility
@@ -417,7 +418,8 @@ Balance notes:
 - Start with dry-run mode
 - Use the mock environment only
 - Avoid reducing the polling interval aggressively
-- This project does not yet include stop loss, exposure limits, or position tracking
+- Review `logs/bot.log`, `logs/trade_history.jsonl`, and `logs/execution_history.jsonl` before enabling real order placement
+- Position sizing, stop loss, cooldowns, allocation caps, and shared-portfolio state are implemented, but you should still treat every config change as a fresh deployment candidate
 
 ## Future Improvements
 
