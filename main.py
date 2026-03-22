@@ -57,7 +57,7 @@ from portfolio import (
     shared_total_equity,
     total_equity,
 )
-from strategy import Strategy, build_strategy_from_env, evaluate_strategy
+from strategy import PairTunedMeanReversionConfig, Strategy, build_strategy_from_env, evaluate_strategy
 
 
 def get_configured_pairs() -> list[str]:
@@ -81,6 +81,7 @@ BACKTEST_RUNS_DIR = BACKTEST_OUTPUT_DIR / "runs"
 BOT_LOG_FILE = LOG_DIR / "bot.log"
 TRADE_HISTORY_FILE = LOG_DIR / "trade_history.jsonl"
 EXECUTION_HISTORY_FILE = LOG_DIR / "execution_history.jsonl"
+EXECUTED_TRADES_FILE = LOG_DIR / "executed_trades.jsonl"
 STARTING_BALANCE_FILE = LOG_DIR / "starting_wallet.json"
 PORTFOLIO_STATE_FILE = LOG_DIR / "portfolio_state.json"
 DAILY_TRADE_STATE_FILE = LOG_DIR / "daily_trade_state.json"
@@ -165,6 +166,55 @@ def append_execution_history(entry: Dict[str, Any]) -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     with EXECUTION_HISTORY_FILE.open("a", encoding="utf-8") as file_handle:
         file_handle.write(json.dumps(entry) + "\n")
+
+
+def append_executed_trade(entry: Dict[str, Any]) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    with EXECUTED_TRADES_FILE.open("a", encoding="utf-8") as file_handle:
+        file_handle.write(json.dumps(entry) + "\n")
+
+
+def record_executed_trade(
+    *,
+    timestamp: datetime,
+    pair: str,
+    requested_price: float,
+    signal_reason: Optional[str],
+    strategy_name: str,
+    order_result: Dict[str, Any],
+    source: str,
+    daily_trade_fallback: bool = False,
+) -> None:
+    if order_result.get("status") != "placed":
+        return
+
+    response = order_result.get("response") or {}
+    order_detail = response.get("OrderDetail") or {}
+    append_executed_trade(
+        {
+            "timestamp": timestamp.isoformat(),
+            "pair": pair,
+            "side": order_result.get("side"),
+            "signal_reason": signal_reason,
+            "strategy_name": strategy_name,
+            "source": source,
+            "daily_trade_fallback": daily_trade_fallback,
+            "requested_price": requested_price,
+            "requested_quantity": order_result.get("quantity"),
+            "requested_notional": order_result.get("notional"),
+            "order_status": order_result.get("status"),
+            "exchange_success": response.get("Success"),
+            "exchange_error_message": response.get("ErrMsg"),
+            "exchange_order_id": order_detail.get("OrderID"),
+            "exchange_status": order_detail.get("Status"),
+            "filled_average_price": order_detail.get("FilledAverPrice"),
+            "filled_quantity": order_detail.get("FilledQuantity"),
+            "commission_coin": order_detail.get("CommissionCoin"),
+            "commission_value": order_detail.get("CommissionChargeValue"),
+            "exchange_create_timestamp": order_detail.get("CreateTimestamp"),
+            "exchange_finish_timestamp": order_detail.get("FinishTimestamp"),
+        }
+    )
 
 
 def _serialize_backtest_field(value: Any) -> Any:
@@ -280,6 +330,76 @@ def _coerce_price_history(values: Any, maxlen: int) -> deque[float]:
     return history
 
 
+def _bootstrap_single_price_history_from_trade_history(pair: str, maxlen: int) -> deque[float]:
+    history: deque[float] = deque(maxlen=maxlen)
+    if not TRADE_HISTORY_FILE.exists():
+        return history
+
+    with TRADE_HISTORY_FILE.open("r", encoding="utf-8") as file_handle:
+        for line in file_handle:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, dict) or entry.get("pair") != pair:
+                continue
+            try:
+                history.append(float(entry["price"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return history
+
+
+def _bootstrap_multi_price_histories_from_trade_history(
+    pairs: list[str],
+    maxlen: int,
+) -> Dict[str, deque[float]]:
+    histories = {pair: deque(maxlen=maxlen) for pair in pairs}
+    if not TRADE_HISTORY_FILE.exists():
+        return histories
+
+    pair_set = set(pairs)
+    with TRADE_HISTORY_FILE.open("r", encoding="utf-8") as file_handle:
+        for line in file_handle:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            pair = entry.get("pair")
+            if pair not in pair_set:
+                continue
+            try:
+                histories[pair].append(float(entry["price"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return histories
+
+
+def _required_history_for_pair(pair: str) -> int:
+    strategy_config = ACTIVE_STRATEGY.config
+    if isinstance(strategy_config, PairTunedMeanReversionConfig):
+        return strategy_config.pair_configs.get(pair, strategy_config.default_config).required_history
+    return ACTIVE_STRATEGY.required_history
+
+
+def _log_recovered_history_status(pair: str, recovered_bars: int) -> None:
+    required_history = _required_history_for_pair(pair)
+    remaining_bars = max(required_history - recovered_bars, 0)
+    logger.info(
+        "Recovered %d/%d bars for %s, %d bars still needed.",
+        min(recovered_bars, required_history),
+        required_history,
+        pair,
+        remaining_bars,
+    )
+
+
 def save_single_price_history(price_history: deque[float]) -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -293,17 +413,37 @@ def save_single_price_history(price_history: deque[float]) -> None:
 
 def load_single_price_history(maxlen: int) -> deque[float]:
     if not PRICE_HISTORY_STATE_FILE.exists():
-        return deque(maxlen=maxlen)
+        history = _bootstrap_single_price_history_from_trade_history(PAIR, maxlen)
+        if history:
+            logger.info(
+                "Bootstrapped %d cached prices for %s from %s.",
+                len(history),
+                PAIR,
+                TRADE_HISTORY_FILE,
+            )
+        return history
     with PRICE_HISTORY_STATE_FILE.open("r", encoding="utf-8") as file_handle:
         raw_data = json.load(file_handle)
     if not isinstance(raw_data, dict):
-        return deque(maxlen=maxlen)
+        return _bootstrap_single_price_history_from_trade_history(PAIR, maxlen)
     if raw_data.get("mode") not in {None, "single"}:
-        return deque(maxlen=maxlen)
+        return _bootstrap_single_price_history_from_trade_history(PAIR, maxlen)
     saved_pair = str(raw_data.get("pair") or PAIR)
     if saved_pair != PAIR:
-        return deque(maxlen=maxlen)
-    return _coerce_price_history(raw_data.get("prices", []), maxlen)
+        return _bootstrap_single_price_history_from_trade_history(PAIR, maxlen)
+    history = _coerce_price_history(raw_data.get("prices", []), maxlen)
+    if history:
+        return history
+    bootstrapped = _bootstrap_single_price_history_from_trade_history(PAIR, maxlen)
+    if bootstrapped:
+        logger.info(
+            "Bootstrapped %d cached prices for %s from %s because %s was empty.",
+            len(bootstrapped),
+            PAIR,
+            TRADE_HISTORY_FILE,
+            PRICE_HISTORY_STATE_FILE,
+        )
+    return bootstrapped
 
 
 def save_multi_price_histories(histories: Dict[str, deque[float]]) -> None:
@@ -319,19 +459,38 @@ def save_multi_price_histories(histories: Dict[str, deque[float]]) -> None:
 def load_multi_price_histories(pairs: list[str], maxlen: int) -> Dict[str, deque[float]]:
     histories = {pair: deque(maxlen=maxlen) for pair in pairs}
     if not PRICE_HISTORY_STATE_FILE.exists():
+        histories = _bootstrap_multi_price_histories_from_trade_history(pairs, maxlen)
+        bootstrapped_pairs = {pair: len(history) for pair, history in histories.items() if history}
+        if bootstrapped_pairs:
+            logger.info(
+                "Bootstrapped cached prices from %s for pairs: %s.",
+                TRADE_HISTORY_FILE,
+                bootstrapped_pairs,
+            )
         return histories
     with PRICE_HISTORY_STATE_FILE.open("r", encoding="utf-8") as file_handle:
         raw_data = json.load(file_handle)
     if not isinstance(raw_data, dict):
-        return histories
+        return _bootstrap_multi_price_histories_from_trade_history(pairs, maxlen)
     if raw_data.get("mode") not in {None, "multi"}:
-        return histories
+        return _bootstrap_multi_price_histories_from_trade_history(pairs, maxlen)
     raw_pairs = raw_data.get("pairs", {})
     if not isinstance(raw_pairs, dict):
-        return histories
+        return _bootstrap_multi_price_histories_from_trade_history(pairs, maxlen)
     for pair in pairs:
         histories[pair] = _coerce_price_history(raw_pairs.get(pair, []), maxlen)
-    return histories
+    if any(histories[pair] for pair in pairs):
+        return histories
+    bootstrapped = _bootstrap_multi_price_histories_from_trade_history(pairs, maxlen)
+    bootstrapped_pairs = {pair: len(history) for pair, history in bootstrapped.items() if history}
+    if bootstrapped_pairs:
+        logger.info(
+            "Bootstrapped cached prices from %s because %s was empty: %s.",
+            TRADE_HISTORY_FILE,
+            PRICE_HISTORY_STATE_FILE,
+            bootstrapped_pairs,
+        )
+    return bootstrapped
 
 
 def save_portfolio_state(
@@ -1085,12 +1244,7 @@ def run_single_asset_bot() -> None:
     logger.info("Strategy config: %s", ACTIVE_STRATEGY.config)
     logger.info("Portfolio config: %s", PORTFOLIO_CONFIG)
     logger.info("Daily trade requirement config: %s", DAILY_TRADE_REQUIREMENT_CONFIG)
-    if price_history:
-        logger.info(
-            "Loaded %d cached prices for %s. Warmup progress starts from the persisted history cache.",
-            len(price_history),
-            PAIR,
-        )
+    _log_recovered_history_status(PAIR, len(price_history))
 
     while True:
         try:
@@ -1286,6 +1440,15 @@ def run_single_asset_bot() -> None:
                         "order": order_result,
                     }
                 )
+            record_executed_trade(
+                timestamp=cycle_timestamp,
+                pair=PAIR,
+                requested_price=price,
+                signal_reason=decision.reason,
+                strategy_name=ACTIVE_STRATEGY.name,
+                order_result=order_result,
+                source="strategy",
+            )
             if fallback_order_result is not None and fallback_order_result.get("status") in {"dry_run", "placed"}:
                 append_execution_history(
                     {
@@ -1312,6 +1475,17 @@ def run_single_asset_bot() -> None:
                         "wallet_change": wallet_change,
                         "order": fallback_order_result,
                     }
+                )
+            if fallback_order_result is not None:
+                record_executed_trade(
+                    timestamp=cycle_timestamp,
+                    pair=PAIR,
+                    requested_price=price,
+                    signal_reason=fallback_reason,
+                    strategy_name=ACTIVE_STRATEGY.name,
+                    order_result=fallback_order_result,
+                    source="daily_trade_fallback",
+                    daily_trade_fallback=True,
                 )
         except (RoostooAPIError, ValueError) as exc:
             logger.exception("Bot cycle failed: %s", exc)
@@ -1360,12 +1534,8 @@ def run_multi_asset_bot() -> None:
     logger.info("Strategy config: %s", ACTIVE_STRATEGY.config)
     logger.info("Portfolio config: %s", PORTFOLIO_CONFIG)
     logger.info("Daily trade requirement config: %s", DAILY_TRADE_REQUIREMENT_CONFIG)
-    loaded_counts = {pair: len(history) for pair, history in histories.items() if history}
-    if loaded_counts:
-        logger.info(
-            "Loaded cached price histories. Warmup progress starts from persisted history cache: %s",
-            loaded_counts,
-        )
+    for pair in CONFIGURED_PAIRS:
+        _log_recovered_history_status(pair, len(histories[pair]))
 
     while True:
         try:
@@ -1680,6 +1850,15 @@ def run_multi_asset_bot() -> None:
                             "order": output["order_result"],
                         }
                     )
+                record_executed_trade(
+                    timestamp=cycle_timestamp,
+                    pair=pair,
+                    requested_price=price,
+                    signal_reason=decision.reason,
+                    strategy_name=ACTIVE_STRATEGY.name,
+                    order_result=output["order_result"],
+                    source="strategy",
+                )
                 if output.get("fallback_order_result", {}).get("status") in {"dry_run", "placed"}:
                     append_execution_history(
                         {
@@ -1711,6 +1890,17 @@ def run_multi_asset_bot() -> None:
                             "wallet_change": wallet_change,
                             "order": output["fallback_order_result"],
                         }
+                    )
+                if output.get("fallback_order_result") is not None:
+                    record_executed_trade(
+                        timestamp=cycle_timestamp,
+                        pair=pair,
+                        requested_price=price,
+                        signal_reason=output.get("fallback_reason"),
+                        strategy_name=ACTIVE_STRATEGY.name,
+                        order_result=output["fallback_order_result"],
+                        source="daily_trade_fallback",
+                        daily_trade_fallback=True,
                     )
 
             save_shared_portfolio_state(portfolio_state, pair_states)
