@@ -324,11 +324,15 @@ def compute_sell_units(
     state: PortfolioState,
     current_price: float,
     config: PortfolioConfig,
+    sell_fraction_pct_override: Optional[float] = None,
 ) -> float:
     if state.position_units <= POSITION_EPSILON:
         return 0.0
 
-    units_to_sell = state.position_units * config.sell_fraction_pct
+    sell_fraction_pct = (
+        sell_fraction_pct_override if sell_fraction_pct_override is not None else config.sell_fraction_pct
+    )
+    units_to_sell = state.position_units * sell_fraction_pct
     units_to_sell = min(units_to_sell, state.position_units)
     if units_to_sell <= POSITION_EPSILON:
         return 0.0
@@ -513,12 +517,16 @@ def shared_compute_sell_units(
     pair: str,
     current_price: float,
     config: PortfolioConfig,
+    sell_fraction_pct_override: Optional[float] = None,
 ) -> float:
     position = get_pair_position_state(portfolio_state, pair)
     if position.position_units <= POSITION_EPSILON:
         return 0.0
 
-    units_to_sell = position.position_units * config.sell_fraction_pct
+    sell_fraction_pct = (
+        sell_fraction_pct_override if sell_fraction_pct_override is not None else config.sell_fraction_pct
+    )
+    units_to_sell = position.position_units * sell_fraction_pct
     units_to_sell = min(units_to_sell, position.position_units)
     if units_to_sell <= POSITION_EPSILON:
         return 0.0

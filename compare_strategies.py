@@ -131,6 +131,7 @@ def run_case(csv_paths: List[str], overrides: Dict[str, str], label: str, timese
             bars = load_price_bars(csv_paths[0])
             summary = run_backtest(
                 bars,
+                pair=infer_pair_from_csv_path(csv_paths[0]),
                 starting_cash=starting_cash,
                 fee_rate=fee_rate,
                 strategy=strategy,

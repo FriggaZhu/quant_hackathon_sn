@@ -214,6 +214,7 @@ def _is_backtest_dust_position(units: float, price: Optional[float], portfolio_c
 
 def run_backtest(
     bars: Sequence[PriceBar],
+    pair: Optional[str] = None,
     starting_cash: float = 10_000.0,
     fee_rate: float = 0.001,
     strategy: Optional[Strategy] = None,
@@ -261,7 +262,7 @@ def run_backtest(
             cooldown_remaining=cooldown_remaining,
             bars_since_entry=bars_since_entry,
             strategy=strategy,
-            position_context=position_context,
+            position_context={**position_context, "pair": pair},
         )
         position_context["in_trend_mode"] = bool(decision.debug.get("in_trend_mode", False))
         signal = decision.signal
@@ -318,7 +319,12 @@ def run_backtest(
                 skipped_sells += 1
                 action_taken = "SKIPPED_SELL"
             else:
-                units_to_sell = compute_sell_units(portfolio_state, bar.close, portfolio_config)
+                units_to_sell = compute_sell_units(
+                    portfolio_state,
+                    bar.close,
+                    portfolio_config,
+                    sell_fraction_pct_override=decision.sell_fraction_pct_override,
+                )
                 if units_to_sell <= 0:
                     skipped_sells += 1
                     action_taken = "SKIPPED_SELL"
@@ -661,7 +667,7 @@ def run_multi_asset_backtest(
                 cooldown_remaining=int(state["cooldown_remaining"]),
                 bars_since_entry=int(state["bars_since_entry"]),
                 strategy=strategy,
-                position_context={"in_trend_mode": bool(state.get("in_trend_mode", False))},
+                position_context={"in_trend_mode": bool(state.get("in_trend_mode", False)), "pair": pair},
             )
             state["in_trend_mode"] = bool(decision.debug.get("in_trend_mode", False))
             pair_decisions[pair] = {
@@ -695,7 +701,13 @@ def run_multi_asset_backtest(
                 pair_actions[pair] = "SKIPPED_SELL"
                 continue
 
-            units_to_sell = shared_compute_sell_units(portfolio_state, pair, bar.close, portfolio_config)
+            units_to_sell = shared_compute_sell_units(
+                portfolio_state,
+                pair,
+                bar.close,
+                portfolio_config,
+                sell_fraction_pct_override=decision.sell_fraction_pct_override,
+            )
             if units_to_sell <= 0:
                 state["skipped_sells"] = int(state["skipped_sells"]) + 1
                 pair_actions[pair] = "SKIPPED_SELL"

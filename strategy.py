@@ -10,6 +10,7 @@ class StrategyDecision:
     reason: str
     debug: Dict[str, Any] = field(default_factory=dict)
     buy_fraction_pct_override: Optional[float] = None
+    sell_fraction_pct_override: Optional[float] = None
 
 
 @dataclass
@@ -41,6 +42,7 @@ class MeanReversionConfig:
     trend_extension_ema_slow_period: int = 21
     trend_extension_rsi_threshold: float = 55.0
     trend_extension_trailing_stop_pct: float = 0.012
+    trend_extension_sell_fraction_pct: Optional[float] = None
     require_price_above_trend_ema_for_entry: bool = False
     entry_below_trend_ema_buffer_pct: float = 0.0
 
@@ -52,6 +54,22 @@ class MeanReversionConfig:
             self.rsi_period + 1,
             self.trend_extension_ema_slow_period + 1,
         )
+
+
+@dataclass
+class PairTunedMeanReversionConfig:
+    default_config: MeanReversionConfig
+    pair_configs: Dict[str, MeanReversionConfig] = field(default_factory=dict)
+
+    @property
+    def required_history(self) -> int:
+        histories = [self.default_config.required_history]
+        histories.extend(config.required_history for config in self.pair_configs.values())
+        return max(histories)
+
+    @property
+    def cooldown_periods(self) -> int:
+        return self.default_config.cooldown_periods
 
 
 @dataclass
@@ -210,6 +228,7 @@ class RegimeSwitchConfig:
 
 StrategyConfig = Union[
     MeanReversionConfig,
+    PairTunedMeanReversionConfig,
     MultiFactorConfig,
     MultiTimeframeMeanReversionConfig,
     MultiTimeframeMeanReversionV2Config,
@@ -368,6 +387,96 @@ def _to_bool(value: str, default: bool = True) -> bool:
     if normalized in {"0", "false", "no", "n", "off"}:
         return False
     return default
+
+
+def _to_optional_float(value: str) -> Optional[float]:
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    return float(cleaned)
+
+
+MEAN_REVERSION_ENV_SPECS = [
+    ("bollinger_period", "BOLLINGER_PERIOD", int, "20"),
+    ("bollinger_stddev", "BOLLINGER_STDDEV", float, "2.0"),
+    ("trend_ema_period", "TREND_EMA_PERIOD", int, "50"),
+    ("rsi_period", "RSI_PERIOD", int, "14"),
+    ("rsi_entry_threshold", "RSI_ENTRY_THRESHOLD", float, "30"),
+    ("rsi_exit_threshold", "RSI_EXIT_THRESHOLD", float, "56"),
+    ("max_trend_distance_pct", "MAX_TREND_DISTANCE_PCT", float, "1.5"),
+    ("stop_loss_pct", "STOP_LOSS_PCT", float, "0.01"),
+    ("take_profit_pct", "TAKE_PROFIT_PCT", float, "0.015"),
+    ("cooldown_periods", "COOLDOWN_PERIODS", int, "4"),
+    ("lower_band_entry_buffer_pct", "LOWER_BAND_ENTRY_BUFFER_PCT", float, "0.003"),
+    ("allow_scale_in", "ALLOW_SCALE_IN", lambda value: _to_bool(value, default=True), "true"),
+    ("min_distance_to_mid_pct", "MIN_DISTANCE_TO_MID_PCT", float, "0.004"),
+    ("middle_band_exit_buffer_pct", "MIDDLE_BAND_EXIT_BUFFER_PCT", float, "0.002"),
+    ("minimum_hold_bars", "MINIMUM_HOLD_BARS", int, "2"),
+    ("weak_rsi_entry_threshold", "WEAK_RSI_ENTRY_THRESHOLD", float, "34"),
+    ("strong_buy_fraction_pct", "STRONG_BUY_FRACTION_PCT", float, "0.10"),
+    ("weak_buy_fraction_pct", "WEAK_BUY_FRACTION_PCT", float, "0.05"),
+    ("assumed_round_trip_cost_pct", "ASSUMED_ROUND_TRIP_COST_PCT", float, "0.0025"),
+    ("minimum_edge_to_cost_ratio", "MIN_EDGE_TO_COST_RATIO", float, "1.5"),
+    ("volatility_period", "VOLATILITY_PERIOD", int, "20"),
+    ("max_volatility", "MAX_VOLATILITY", float, "0.016"),
+    ("trend_extension_enabled", "TREND_EXTENSION_ENABLED", lambda value: _to_bool(value, default=False), "false"),
+    ("trend_extension_ema_fast_period", "TREND_EXTENSION_EMA_FAST_PERIOD", int, "9"),
+    ("trend_extension_ema_slow_period", "TREND_EXTENSION_EMA_SLOW_PERIOD", int, "21"),
+    ("trend_extension_rsi_threshold", "TREND_EXTENSION_RSI_THRESHOLD", float, "55"),
+    ("trend_extension_trailing_stop_pct", "TREND_EXTENSION_TRAILING_STOP_PCT", float, "0.012"),
+    ("trend_extension_sell_fraction_pct", "TREND_EXTENSION_SELL_FRACTION_PCT", _to_optional_float, ""),
+    (
+        "require_price_above_trend_ema_for_entry",
+        "REQUIRE_PRICE_ABOVE_TREND_EMA_FOR_ENTRY",
+        lambda value: _to_bool(value, default=False),
+        "false",
+    ),
+    ("entry_below_trend_ema_buffer_pct", "ENTRY_BELOW_TREND_EMA_BUFFER_PCT", float, "0.0"),
+]
+
+
+def _normalize_pair_key(pair: str) -> str:
+    return pair.strip().upper().replace("/", "_").replace("-", "_")
+
+
+def _pair_key_to_pair(pair_key: str) -> str:
+    normalized = pair_key.strip().upper()
+    if "/" in normalized:
+        return normalized
+    if "_" in normalized:
+        base_asset, quote_asset = normalized.split("_", 1)
+        return f"{base_asset}/{quote_asset}"
+    return normalized
+
+
+def _build_mean_reversion_config_from_lookup(
+    lookup: Callable[[str, str], str],
+) -> MeanReversionConfig:
+    payload: Dict[str, Any] = {}
+    for field_name, suffix, parser, default in MEAN_REVERSION_ENV_SPECS:
+        payload[field_name] = parser(lookup(suffix, default))
+    return MeanReversionConfig(**payload)
+
+
+def _load_pair_tuned_mean_reversion_configs(
+    default_config: MeanReversionConfig,
+) -> Dict[str, MeanReversionConfig]:
+    pair_keys: set[str] = set()
+    for env_key in os.environ:
+        if not env_key.startswith("ROOSTOO_PAIRCFG_") or "_MR_" not in env_key:
+            continue
+        pair_key = env_key[len("ROOSTOO_PAIRCFG_") :].split("_MR_", 1)[0]
+        if pair_key:
+            pair_keys.add(pair_key)
+
+    pair_configs: Dict[str, MeanReversionConfig] = {}
+    for pair_key in sorted(pair_keys):
+        pair_name = _pair_key_to_pair(pair_key)
+        prefix = f"ROOSTOO_PAIRCFG_{pair_key}_MR_"
+        pair_configs[pair_name] = _build_mean_reversion_config_from_lookup(
+            lambda suffix, default: os.getenv(prefix + suffix, os.getenv(f"ROOSTOO_MR_{suffix}", default))
+        )
+    return pair_configs
 
 
 def _required_edge_pct(min_distance_to_mid_pct: float, assumed_round_trip_cost_pct: float, ratio: float) -> float:
@@ -531,6 +640,7 @@ def _mean_reversion_evaluate(
         "trend_extension_ema_fast": trend_extension_ema_fast,
         "trend_extension_ema_slow": trend_extension_ema_slow,
         "trend_extension_rsi_threshold": config.trend_extension_rsi_threshold,
+        "trend_extension_sell_fraction_pct": config.trend_extension_sell_fraction_pct,
         "trend_trigger": trend_trigger,
         "previous_in_trend_mode": previous_in_trend_mode,
         "in_trend_mode": in_trend_mode,
@@ -562,10 +672,20 @@ def _mean_reversion_evaluate(
                 and trend_extension_ema_slow is not None
                 and trend_extension_ema_fast < trend_extension_ema_slow
             ):
-                return StrategyDecision("SELL", "trend_extension_ema_fast_below_slow", debug)
+                return StrategyDecision(
+                    "SELL",
+                    "trend_extension_ema_fast_below_slow",
+                    debug,
+                    sell_fraction_pct_override=config.trend_extension_sell_fraction_pct,
+                )
 
             if trailing_stop_price is not None and current_price <= trailing_stop_price:
-                return StrategyDecision("SELL", "trend_extension_trailing_stop_hit", debug)
+                return StrategyDecision(
+                    "SELL",
+                    "trend_extension_trailing_stop_hit",
+                    debug,
+                    sell_fraction_pct_override=config.trend_extension_sell_fraction_pct,
+                )
 
             return StrategyDecision("HOLD", "holding_trend_extension", debug)
 
@@ -653,6 +773,39 @@ def _mean_reversion_evaluate(
         )
 
     return StrategyDecision("HOLD", "no_entry", debug)
+
+
+def _pair_tuned_mean_reversion_evaluate(
+    recent_closes: Sequence[float],
+    in_position: bool,
+    entry_price: Optional[float],
+    cooldown_remaining: int,
+    bars_since_entry: int,
+    position_context: Optional[Dict[str, Any]],
+    config: StrategyConfig,
+) -> StrategyDecision:
+    if not isinstance(config, PairTunedMeanReversionConfig):
+        raise TypeError("Pair-tuned mean reversion strategy requires PairTunedMeanReversionConfig.")
+
+    pair = str((position_context or {}).get("pair") or "").upper()
+    resolved_config = config.pair_configs.get(pair, config.default_config)
+    decision = _mean_reversion_evaluate(
+        recent_closes,
+        in_position,
+        entry_price,
+        cooldown_remaining,
+        bars_since_entry,
+        position_context,
+        resolved_config,
+    )
+    debug = dict(decision.debug)
+    debug["base_strategy_name"] = debug.get("strategy_name", "mean_reversion")
+    debug["strategy_variant"] = "pair_tuned_mean_reversion"
+    debug["strategy_name"] = debug["base_strategy_name"]
+    debug["pair"] = pair or None
+    debug["pair_config_source"] = "pair_override" if pair in config.pair_configs else "default"
+    decision.debug = debug
+    return decision
 
 
 def _multifactor_evaluate(
@@ -1290,45 +1443,25 @@ def _regime_switch_evaluate(
 
 
 def build_mean_reversion_strategy() -> Strategy:
-    config = MeanReversionConfig(
-        bollinger_period=int(os.getenv("ROOSTOO_MR_BOLLINGER_PERIOD", "20")),
-        bollinger_stddev=float(os.getenv("ROOSTOO_MR_BOLLINGER_STDDEV", "2.0")),
-        trend_ema_period=int(os.getenv("ROOSTOO_MR_TREND_EMA_PERIOD", "50")),
-        rsi_period=int(os.getenv("ROOSTOO_MR_RSI_PERIOD", "14")),
-        rsi_entry_threshold=float(os.getenv("ROOSTOO_MR_RSI_ENTRY_THRESHOLD", "30")),
-        rsi_exit_threshold=float(os.getenv("ROOSTOO_MR_RSI_EXIT_THRESHOLD", "56")),
-        max_trend_distance_pct=float(os.getenv("ROOSTOO_MR_MAX_TREND_DISTANCE_PCT", "1.5")),
-        stop_loss_pct=float(os.getenv("ROOSTOO_MR_STOP_LOSS_PCT", "0.01")),
-        take_profit_pct=float(os.getenv("ROOSTOO_MR_TAKE_PROFIT_PCT", "0.015")),
-        cooldown_periods=int(os.getenv("ROOSTOO_MR_COOLDOWN_PERIODS", "4")),
-        lower_band_entry_buffer_pct=float(os.getenv("ROOSTOO_MR_LOWER_BAND_ENTRY_BUFFER_PCT", "0.003")),
-        allow_scale_in=_to_bool(os.getenv("ROOSTOO_MR_ALLOW_SCALE_IN", "true"), default=True),
-        min_distance_to_mid_pct=float(os.getenv("ROOSTOO_MR_MIN_DISTANCE_TO_MID_PCT", "0.004")),
-        middle_band_exit_buffer_pct=float(os.getenv("ROOSTOO_MR_MIDDLE_BAND_EXIT_BUFFER_PCT", "0.002")),
-        minimum_hold_bars=int(os.getenv("ROOSTOO_MR_MINIMUM_HOLD_BARS", "2")),
-        weak_rsi_entry_threshold=float(os.getenv("ROOSTOO_MR_WEAK_RSI_ENTRY_THRESHOLD", "34")),
-        strong_buy_fraction_pct=float(os.getenv("ROOSTOO_MR_STRONG_BUY_FRACTION_PCT", "0.10")),
-        weak_buy_fraction_pct=float(os.getenv("ROOSTOO_MR_WEAK_BUY_FRACTION_PCT", "0.05")),
-        assumed_round_trip_cost_pct=float(os.getenv("ROOSTOO_MR_ASSUMED_ROUND_TRIP_COST_PCT", "0.0025")),
-        minimum_edge_to_cost_ratio=float(os.getenv("ROOSTOO_MR_MIN_EDGE_TO_COST_RATIO", "1.5")),
-        volatility_period=int(os.getenv("ROOSTOO_MR_VOLATILITY_PERIOD", "20")),
-        max_volatility=float(os.getenv("ROOSTOO_MR_MAX_VOLATILITY", "0.016")),
-        trend_extension_enabled=_to_bool(os.getenv("ROOSTOO_MR_TREND_EXTENSION_ENABLED", "false"), default=False),
-        trend_extension_ema_fast_period=int(os.getenv("ROOSTOO_MR_TREND_EXTENSION_EMA_FAST_PERIOD", "9")),
-        trend_extension_ema_slow_period=int(os.getenv("ROOSTOO_MR_TREND_EXTENSION_EMA_SLOW_PERIOD", "21")),
-        trend_extension_rsi_threshold=float(os.getenv("ROOSTOO_MR_TREND_EXTENSION_RSI_THRESHOLD", "55")),
-        trend_extension_trailing_stop_pct=float(
-            os.getenv("ROOSTOO_MR_TREND_EXTENSION_TRAILING_STOP_PCT", "0.012")
-        ),
-        require_price_above_trend_ema_for_entry=_to_bool(
-            os.getenv("ROOSTOO_MR_REQUIRE_PRICE_ABOVE_TREND_EMA_FOR_ENTRY", "false"),
-            default=False,
-        ),
-        entry_below_trend_ema_buffer_pct=float(
-            os.getenv("ROOSTOO_MR_ENTRY_BELOW_TREND_EMA_BUFFER_PCT", "0.0")
-        ),
+    config = _build_mean_reversion_config_from_lookup(
+        lambda suffix, default: os.getenv(f"ROOSTOO_MR_{suffix}", default)
     )
     return Strategy(name="mean_reversion", config=config, evaluator=_mean_reversion_evaluate)
+
+
+def build_pair_tuned_mean_reversion_strategy() -> Strategy:
+    default_config = _build_mean_reversion_config_from_lookup(
+        lambda suffix, default: os.getenv(f"ROOSTOO_MR_{suffix}", default)
+    )
+    config = PairTunedMeanReversionConfig(
+        default_config=default_config,
+        pair_configs=_load_pair_tuned_mean_reversion_configs(default_config),
+    )
+    return Strategy(
+        name="pair_tuned_mean_reversion",
+        config=config,
+        evaluator=_pair_tuned_mean_reversion_evaluate,
+    )
 
 
 def build_multifactor_strategy() -> Strategy:
@@ -1477,6 +1610,7 @@ def build_regime_switch_strategy() -> Strategy:
 
 STRATEGY_BUILDERS: Dict[str, Callable[[], Strategy]] = {
     "mean_reversion": build_mean_reversion_strategy,
+    "pair_tuned_mean_reversion": build_pair_tuned_mean_reversion_strategy,
     "multi_factor": build_multifactor_strategy,
     "mtf_mean_reversion": build_mtf_mean_reversion_strategy,
     "mtf_mean_reversion_v2": build_mtf_mean_reversion_v2_strategy,

@@ -84,6 +84,7 @@ EXECUTION_HISTORY_FILE = LOG_DIR / "execution_history.jsonl"
 STARTING_BALANCE_FILE = LOG_DIR / "starting_wallet.json"
 PORTFOLIO_STATE_FILE = LOG_DIR / "portfolio_state.json"
 DAILY_TRADE_STATE_FILE = LOG_DIR / "daily_trade_state.json"
+PRICE_HISTORY_STATE_FILE = LOG_DIR / "price_history_state.json"
 BACKTEST_LATEST_SUMMARY_FILE = BACKTEST_SUMMARY_DIR / "backtest_latest_summary.json"
 BACKTEST_HISTORY_JSONL_FILE = BACKTEST_SUMMARY_DIR / "backtest_runs.jsonl"
 BACKTEST_HISTORY_CSV_FILE = BACKTEST_SUMMARY_DIR / "backtest_runs.csv"
@@ -265,6 +266,72 @@ def load_daily_trade_state() -> DailyTradeRequirementState:
         return DailyTradeRequirementState.from_dict(raw_data)
     except (TypeError, ValueError):
         return DailyTradeRequirementState()
+
+
+def _coerce_price_history(values: Any, maxlen: int) -> deque[float]:
+    history: deque[float] = deque(maxlen=maxlen)
+    if not isinstance(values, list):
+        return history
+    for value in values[-maxlen:]:
+        try:
+            history.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return history
+
+
+def save_single_price_history(price_history: deque[float]) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "mode": "single",
+        "pair": PAIR,
+        "prices": [float(price) for price in price_history],
+    }
+    with PRICE_HISTORY_STATE_FILE.open("w", encoding="utf-8") as file_handle:
+        json.dump(payload, file_handle, indent=2, sort_keys=True)
+
+
+def load_single_price_history(maxlen: int) -> deque[float]:
+    if not PRICE_HISTORY_STATE_FILE.exists():
+        return deque(maxlen=maxlen)
+    with PRICE_HISTORY_STATE_FILE.open("r", encoding="utf-8") as file_handle:
+        raw_data = json.load(file_handle)
+    if not isinstance(raw_data, dict):
+        return deque(maxlen=maxlen)
+    if raw_data.get("mode") not in {None, "single"}:
+        return deque(maxlen=maxlen)
+    saved_pair = str(raw_data.get("pair") or PAIR)
+    if saved_pair != PAIR:
+        return deque(maxlen=maxlen)
+    return _coerce_price_history(raw_data.get("prices", []), maxlen)
+
+
+def save_multi_price_histories(histories: Dict[str, deque[float]]) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "mode": "multi",
+        "pairs": {pair: [float(price) for price in history] for pair, history in histories.items()},
+    }
+    with PRICE_HISTORY_STATE_FILE.open("w", encoding="utf-8") as file_handle:
+        json.dump(payload, file_handle, indent=2, sort_keys=True)
+
+
+def load_multi_price_histories(pairs: list[str], maxlen: int) -> Dict[str, deque[float]]:
+    histories = {pair: deque(maxlen=maxlen) for pair in pairs}
+    if not PRICE_HISTORY_STATE_FILE.exists():
+        return histories
+    with PRICE_HISTORY_STATE_FILE.open("r", encoding="utf-8") as file_handle:
+        raw_data = json.load(file_handle)
+    if not isinstance(raw_data, dict):
+        return histories
+    if raw_data.get("mode") not in {None, "multi"}:
+        return histories
+    raw_pairs = raw_data.get("pairs", {})
+    if not isinstance(raw_pairs, dict):
+        return histories
+    for pair in pairs:
+        histories[pair] = _coerce_price_history(raw_pairs.get(pair, []), maxlen)
+    return histories
 
 
 def save_portfolio_state(
@@ -640,6 +707,7 @@ def maybe_place_order(
     portfolio_config: PortfolioConfig,
     buy_fraction_pct_override: Optional[float] = None,
     buy_fraction_pct_multiplier: Optional[float] = None,
+    sell_fraction_pct_override: Optional[float] = None,
 ) -> Dict[str, Any]:
     if signal not in {"BUY", "SELL"}:
         logger.info("Decision is HOLD. No order placed.")
@@ -662,7 +730,12 @@ def maybe_place_order(
             }
         quantity = order_notional / price
     else:
-        quantity = compute_sell_units(portfolio_state, price, portfolio_config)
+        quantity = compute_sell_units(
+            portfolio_state,
+            price,
+            portfolio_config,
+            sell_fraction_pct_override=sell_fraction_pct_override,
+        )
         if quantity <= 0:
             return {
                 "status": "skipped",
@@ -754,6 +827,7 @@ def maybe_place_shared_order(
     portfolio_config: PortfolioConfig,
     buy_fraction_pct_override: Optional[float] = None,
     buy_fraction_pct_multiplier: Optional[float] = None,
+    sell_fraction_pct_override: Optional[float] = None,
 ) -> Dict[str, Any]:
     if signal not in {"BUY", "SELL"}:
         return {"status": "skipped", "reason": "hold", "pair": pair}
@@ -774,7 +848,13 @@ def maybe_place_shared_order(
             return {"status": "skipped", "reason": "buy_size_unavailable", "side": signal, "pair": pair}
         quantity = order_notional / price
     else:
-        quantity = shared_compute_sell_units(portfolio_state, pair, price, portfolio_config)
+        quantity = shared_compute_sell_units(
+            portfolio_state,
+            pair,
+            price,
+            portfolio_config,
+            sell_fraction_pct_override=sell_fraction_pct_override,
+        )
         if quantity <= 0:
             return {"status": "skipped", "reason": "sell_size_unavailable", "side": signal, "pair": pair}
         order_notional = quantity * price
@@ -897,6 +977,7 @@ def print_backtest(
         bars = load_price_bars(csv_path)
         summary = run_backtest(
             bars,
+            pair=infer_pair_from_csv_path(csv_path),
             starting_cash=BACKTEST_INITIAL_CASH,
             fee_rate=BACKTEST_FEE_RATE,
             strategy=ACTIVE_STRATEGY,
@@ -992,7 +1073,7 @@ def run_single_asset_bot() -> None:
     configure_logging()
     client = RoostooClient()
     history_size = max(PRICE_HISTORY_SIZE, ACTIVE_STRATEGY.required_history + 5)
-    price_history = deque(maxlen=history_size)
+    price_history = load_single_price_history(history_size)
     starting_wallet: Optional[Dict[str, float]] = None
     portfolio_state, cooldown_remaining, in_trend_mode = load_portfolio_state()
     daily_trade_state = load_daily_trade_state()
@@ -1004,6 +1085,12 @@ def run_single_asset_bot() -> None:
     logger.info("Strategy config: %s", ACTIVE_STRATEGY.config)
     logger.info("Portfolio config: %s", PORTFOLIO_CONFIG)
     logger.info("Daily trade requirement config: %s", DAILY_TRADE_REQUIREMENT_CONFIG)
+    if price_history:
+        logger.info(
+            "Loaded %d cached prices for %s. Warmup progress starts from the persisted history cache.",
+            len(price_history),
+            PAIR,
+        )
 
     while True:
         try:
@@ -1024,6 +1111,7 @@ def run_single_asset_bot() -> None:
             sync_portfolio_state_with_wallet(portfolio_state, current_wallet, price)
 
             price_history.append(price)
+            save_single_price_history(price_history)
             wallet_change = calculate_wallet_change(starting_wallet, current_wallet)
             current_equity = total_equity(portfolio_state, price)
             current_position_value = position_value(portfolio_state, price)
@@ -1036,7 +1124,7 @@ def run_single_asset_bot() -> None:
                 cooldown_remaining=cooldown_remaining,
                 bars_since_entry=bars_since_entry,
                 strategy=ACTIVE_STRATEGY,
-                position_context={"in_trend_mode": in_trend_mode},
+                position_context={"in_trend_mode": in_trend_mode, "pair": PAIR},
             )
             signal = decision.signal
             debug = decision.debug
@@ -1067,6 +1155,7 @@ def run_single_asset_bot() -> None:
                 PORTFOLIO_CONFIG,
                 buy_fraction_pct_override=decision.buy_fraction_pct_override,
                 buy_fraction_pct_multiplier=buy_fraction_pct_multiplier if signal == "BUY" else None,
+                sell_fraction_pct_override=decision.sell_fraction_pct_override if signal == "SELL" else None,
             )
             if order_result.get("status") in {"dry_run", "placed"}:
                 daily_trade_state = mark_daily_trade_executed(daily_trade_state, cycle_timestamp)
@@ -1103,6 +1192,7 @@ def run_single_asset_bot() -> None:
                         else None
                     ),
                     buy_fraction_pct_multiplier=None,
+                    sell_fraction_pct_override=None,
                 )
                 daily_trade_state = mark_daily_trade_fallback_attempted(daily_trade_state, cycle_timestamp)
                 if fallback_order_result.get("status") in {"dry_run", "placed"}:
@@ -1255,10 +1345,8 @@ def run_single_asset_bot() -> None:
 def run_multi_asset_bot() -> None:
     configure_logging()
     client = RoostooClient()
-    histories = {
-        pair: deque(maxlen=max(PRICE_HISTORY_SIZE, ACTIVE_STRATEGY.required_history + 5))
-        for pair in CONFIGURED_PAIRS
-    }
+    history_size = max(PRICE_HISTORY_SIZE, ACTIVE_STRATEGY.required_history + 5)
+    histories = load_multi_price_histories(CONFIGURED_PAIRS, history_size)
     starting_wallet: Optional[Dict[str, float]] = None
     portfolio_state, pair_states = load_shared_portfolio_state()
     daily_trade_state = load_daily_trade_state()
@@ -1272,6 +1360,12 @@ def run_multi_asset_bot() -> None:
     logger.info("Strategy config: %s", ACTIVE_STRATEGY.config)
     logger.info("Portfolio config: %s", PORTFOLIO_CONFIG)
     logger.info("Daily trade requirement config: %s", DAILY_TRADE_REQUIREMENT_CONFIG)
+    loaded_counts = {pair: len(history) for pair, history in histories.items() if history}
+    if loaded_counts:
+        logger.info(
+            "Loaded cached price histories. Warmup progress starts from persisted history cache: %s",
+            loaded_counts,
+        )
 
     while True:
         try:
@@ -1290,6 +1384,7 @@ def run_multi_asset_bot() -> None:
                 ticker = client.get_ticker(pair)
                 prices_by_pair[pair] = extract_price(ticker, pair)
                 histories[pair].append(prices_by_pair[pair])
+            save_multi_price_histories(histories)
 
             if portfolio_state is None:
                 portfolio_state = initialize_shared_portfolio_state(current_wallet, prices_by_pair)
@@ -1311,7 +1406,10 @@ def run_multi_asset_bot() -> None:
                     cooldown_remaining=int(pair_state["cooldown_remaining"]),
                     bars_since_entry=int(pair_state["bars_since_entry"]),
                     strategy=ACTIVE_STRATEGY,
-                    position_context={"in_trend_mode": bool(pair_state.get("in_trend_mode", False))},
+                    position_context={
+                        "in_trend_mode": bool(pair_state.get("in_trend_mode", False)),
+                        "pair": pair,
+                    },
                 )
                 pair_state["in_trend_mode"] = bool(decision.debug.get("in_trend_mode", False))
                 logger.info(
@@ -1371,6 +1469,9 @@ def run_multi_asset_bot() -> None:
                     PORTFOLIO_CONFIG,
                     buy_fraction_pct_override=decision.buy_fraction_pct_override,
                     buy_fraction_pct_multiplier=None,
+                    sell_fraction_pct_override=decision.sell_fraction_pct_override
+                    if decision.signal == "SELL"
+                    else None,
                 )
                 pair_outputs[pair]["order_result"] = order_result
 
@@ -1416,6 +1517,9 @@ def run_multi_asset_bot() -> None:
                     PORTFOLIO_CONFIG,
                     buy_fraction_pct_override=decision.buy_fraction_pct_override,
                     buy_fraction_pct_multiplier=buy_fraction_pct_multiplier,
+                    sell_fraction_pct_override=decision.sell_fraction_pct_override
+                    if decision.signal == "SELL"
+                    else None,
                 )
                 pair_outputs[pair] = {
                     "order_result": order_result,
@@ -1465,6 +1569,7 @@ def run_multi_asset_bot() -> None:
                             else None
                         ),
                         buy_fraction_pct_multiplier=None,
+                        sell_fraction_pct_override=None,
                     )
                     pair_outputs[fallback_pair]["fallback_order_result"] = fallback_order_result
                     pair_outputs[fallback_pair]["fallback_reason"] = fallback_reason
